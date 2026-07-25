@@ -1,0 +1,31 @@
+name: cascadetorch
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - h5py
+  - seaborn
+  - pyyaml
+  # imaging / preprocessing pipeline (process_using_napari.ipynb,
+  # SlideBook_WF_Timelapse_Dask_Load.ipynb)
+  - dask
+  - scikit-image
+  - scikit-learn
+  - tifffile
+  - zarr
+  - tqdm
+  - networkx
+  - pip:
+    - torch
+    - ruamel.yaml
+    # napari + a Qt6 backend for the notebooks' `%gui qt6` magic.
+    # NOTE: SlideBook_API (used by SlideBook_WF_Timelapse_Dask_Load.ipynb) is a
+    # local/vendor module, not on conda/PyPI -- install it separately.
+    - napari[pyqt6]

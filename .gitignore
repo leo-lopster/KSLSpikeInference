@@ -1,3 +1,16 @@
+### LOCAL
+*.npy
+*.tiff
+*.png
+*.zarr
+
+/datasets/*
+/labels/*
+/preprocessed/*
+/projections/*
+
+
+### PYTHON
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
