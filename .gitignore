@@ -1,13 +1,24 @@
 ### LOCAL
 *.npy
 *.tiff
+*.tif
 *.png
 *.zarr
+*.DS_store
 
 /datasets/*
 /labels/*
 /preprocessed/*
 /projections/*
+
+### LOCAL: CascadeTorch
+*.pyc
+*.eggs
+*.egg-info
+*.pth
+*.mat
+*.h5
+/CascadeTorch/Pretrained_models/*/config.yaml
 
 
 ### PYTHON
