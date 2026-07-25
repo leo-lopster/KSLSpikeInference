@@ -4,7 +4,7 @@
 *.tif
 *.png
 *.zarr
-*.DS_store
+.DS_store
 
 /datasets/*
 /labels/*
