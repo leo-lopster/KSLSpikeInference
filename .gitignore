@@ -6,11 +6,10 @@
 *.zarr
 *.DS_Store
 
-/datasets/*
-/labels/*
-/preprocessed/*
-/projections/*
+/_datasets/*
+/_preprocessed/*
 /_projectnotes/*
+/labels/*.csv
 
 ### LOCAL: CascadeTorch
 *.pyc
