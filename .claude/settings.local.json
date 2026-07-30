@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "Bash(python3 -)",
-      "Bash(jupyter nbconvert *)"
+      "Bash(jupyter nbconvert *)",
+      "Bash(python3 -c ' *)",
+      "Read(//Users/samsonho/KSL/**)",
+      "Bash(ls /Users/samsonho/KSL/leftDRGcut/ | head -40; echo \"=== count frames ===\"; ls /Users/samsonho/KSL/leftDRGcut/raw | wc -l; ls /Users/samsonho/KSL/leftDRGcut/raw | grep -v npy | head; echo \"=== bridge/cascade ===\"; find /Users/samsonho/KSL /Users/samsonho/KSLSpikeInference -maxdepth 3 -name \"run_cascade_ds40.py\" 2>/dev/null; ls /Users/samsonho/KSLSpikeInference/CascadeTorch)",
+      "Read(//Users/samsonho/KSL/leftDRGcut/**)",
+      "Read(//Users/samsonho/KSL/leftDRGcut/raw/**)",
+      "Bash(ls /Users/samsonho/KSLSpikeInference/CascadeTorch/Pretrained_models | grep -i spinal; echo \"---bridge head---\"; head -40 /Users/samsonho/KSLSpikeInference/data_pre-n-vis/run_cascade_ds40.py; echo \"=== diff of bridges ===\"; diff /Users/samsonho/KSL/leftDRGcut/run_cascade_ds40.py /Users/samsonho/KSLSpikeInference/data_pre-n-vis/run_cascade_ds40.py && echo IDENTICAL)",
+      "Read(//Users/samsonho/KSL/leftDRGcut/cascade_runtime/**)",
+      "Read(//Users/samsonho/KSL/leftDRGcut/cascade_runtime/Pretrained_models/**)",
+      "Read(//Users/samsonho/exit\\\\\\(\\\\\\)/envs/CASCADE/bin/**)",
+      "Bash(md5 -q labels/Debi_DRG_ROI.tiff /Users/samsonho/KSL/leftDRGcut/_labels/Debi_DRG_ROI.tiff)",
+      "Bash(python3 - *)",
+      "Bash(ls -la /Users/samsonho/KSL/leftDRGcut/analysis_cache /Users/samsonho/KSLSpikeInference/main/analysis_cache 2>/dev/null | head -30; find /Users/samsonho/KSL/leftDRGcut /Users/samsonho/KSLSpikeInference -name \"*.mp4\" -not -path \"*/.git/*\" 2>/dev/null | head)",
+      "Read(//Users/samsonho/KSL/leftDRGcut/analysis_cache/**)",
+      "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames,r_frame_rate,avg_frame_rate,duration,width,height -of default=nw=1 /Users/samsonho/KSL/leftDRGcut/analysis_cache/whole_field_ch0_step5_roi.mp4)",
+      "Bash('/Users/samsonho/exit\\(\\)/envs/CASCADE/bin/python' -)"
     ]
   }
 }
