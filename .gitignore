@@ -4,12 +4,13 @@
 *.tif
 *.png
 *.zarr
-.DS_store
+*.DS_Store
 
 /datasets/*
 /labels/*
 /preprocessed/*
 /projections/*
+/_projectnotes/*
 
 ### LOCAL: CascadeTorch
 *.pyc
@@ -19,7 +20,6 @@
 *.mat
 *.h5
 /CascadeTorch/Pretrained_models/*/config.yaml
-
 
 ### PYTHON
 # Byte-compiled / optimized / DLL files
@@ -203,3 +203,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
+## Exceptions
+# Examples
+!labels/Debi_DRG_ROI.tiff
