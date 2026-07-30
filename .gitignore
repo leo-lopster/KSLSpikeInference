@@ -11,6 +11,8 @@
 /_projectnotes/*
 /labels/*.csv
 
+/CLAUDE.md
+
 ### LOCAL: CascadeTorch
 *.pyc
 *.eggs
