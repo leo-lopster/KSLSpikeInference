@@ -4,13 +4,14 @@
 *.tif
 *.png
 *.zarr
-*.DS_Store
+.DS_Store
 
-/datasets/*
-/labels/*
-/preprocessed/*
-/projections/*
 /_projectnotes/*
+/datasets/*
+/preprocessed/*
+/labels/*.csv
+
+/CLAUDE.md
 
 ### LOCAL: CascadeTorch
 *.pyc
