@@ -4,11 +4,11 @@
 *.tif
 *.png
 *.zarr
-*.DS_Store
+.DS_Store
 
-/_datasets/*
-/_preprocessed/*
 /_projectnotes/*
+/datasets/*
+/preprocessed/*
 /labels/*.csv
 
 /CLAUDE.md
