@@ -209,3 +209,5 @@ cython_debug/
 ## Exceptions
 # Examples
 !labels/Debi_DRG_ROI.tiff.DS_Store
+
+.claude/settings.local.json
