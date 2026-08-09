@@ -10,7 +10,8 @@
 /datasets/*
 /preprocessed/*
 /labels/*.csv
-
+/.claude/*
+/.vscode/*
 /CLAUDE.md
 
 ### LOCAL: CascadeTorch
