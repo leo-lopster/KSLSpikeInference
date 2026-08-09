@@ -278,3 +278,25 @@ def save(result, out_dir, extra=None):
         json.dump(params, f, indent=2)
     print(f"> Saved spike_rate.npy + spike_inference_params.json -> {out_dir}")
     return out_dir
+
+
+def load(out_dir):
+    """Read back a saved inference. Returns (spike_rate, params).
+
+    The counterpart to `save`, so a session can pick up at the feature/PCA stage without
+    re-running the model. The params sidecar is not optional here: an inferred rate whose
+    model, frame rate and padding are unknown cannot be interpreted, only plotted.
+    """
+    out_dir = Path(out_dir)
+    rate_path = out_dir / "spike_rate.npy"
+    params_path = out_dir / "spike_inference_params.json"
+    missing = [p.name for p in (rate_path, params_path) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"{', '.join(missing)} not in {out_dir}; run CASCADE and save it first.")
+
+    spike_rate = np.load(rate_path)
+    params = json.loads(params_path.read_text())
+    print(f"> Loaded spike_rate {spike_rate.shape} ({params.get('model_name', '?')}, "
+          f"{params.get('recording_frame_rate_hz', float('nan')):.2f} Hz) <- {out_dir}")
+    return spike_rate, params

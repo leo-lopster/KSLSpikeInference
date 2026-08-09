@@ -3,6 +3,9 @@
 Conventions (CLAUDE.md 5): perceptually-uniform colormaps only (viridis/magma, never
 jet); any panel showing inferred spikes names the algorithm and its parameters in the
 same panel.
+
+Every function draws its figure and also returns it, so a caller can hand it to
+`store.save_figure` for export without rebuilding the plot.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ def pca_summary(pca, scores, features, roi_ids, title, var_target=0.80):
     fig.suptitle(title, y=1.02)
     plt.tight_layout()
     plt.show()
+    return fig
 
 
 def dendrogram_plot(Z, roi_ids, title, cut):
@@ -58,6 +62,7 @@ def dendrogram_plot(Z, roi_ids, title, cut):
     ax.set_title(f"{title}  (cut at h={cut:.2f})")
     plt.tight_layout()
     plt.show()
+    return fig
 
 
 def rate_heatmap(spike_rate, t, roi_ids, groups, stim_window, title):
@@ -79,6 +84,7 @@ def rate_heatmap(spike_rate, t, roi_ids, groups, stim_window, title):
     fig.colorbar(im, ax=ax, label="Inferred rate (spikes/s)")
     plt.tight_layout()
     plt.show()
+    return fig
 
 
 def group_means(spike_rate, t, groups, roi_ids, stim_window, pad, title,
@@ -119,3 +125,4 @@ def group_means(spike_rate, t, groups, roi_ids, stim_window, pad, title,
     fig.suptitle(f"{title}\n{subtitle}", y=0.995)
     plt.tight_layout()
     plt.show()
+    return fig

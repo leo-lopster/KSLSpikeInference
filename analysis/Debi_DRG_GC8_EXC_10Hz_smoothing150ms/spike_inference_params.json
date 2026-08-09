@@ -50,8 +50,8 @@
     0.10171795718729208,
     0.13095525168544664
   ],
-  "dataset": "imported",
-  "mode": "full",
+  "dataset": "traces",
+  "mode": "traces",
   "roi_ids": [
     1,
     2,
@@ -85,7 +85,7 @@
     30,
     31
   ],
-  "BASELINE_SLIDES": 20,
-  "START_TIMEPOINT": 0,
-  "EXTRACT_TIMEPOINTS": 300
+  "BASELINE_SLIDES": null,
+  "START_TIMEPOINT": null,
+  "EXTRACT_TIMEPOINTS": null
 }

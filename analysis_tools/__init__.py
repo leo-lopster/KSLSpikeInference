@@ -9,6 +9,6 @@ the constants stay in one place (the notebook's config cell) rather than being s
 across module defaults.
 """
 
-from . import cascade_runner, features, grouping, plots
+from . import cascade_runner, features, grouping, plots, preprocess, store, traces
 
-__all__ = ["cascade_runner", "features", "grouping", "plots"]
+__all__ = ["cascade_runner", "features", "grouping", "plots", "preprocess", "store", "traces"]

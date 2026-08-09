@@ -1,0 +1,15 @@
+{
+  "n_rois": 31,
+  "n_frames": 300,
+  "frame_rate_hz": 10.000000000000014,
+  "duration_s": 29.9,
+  "units": "dF/F0 (dimensionless)",
+  "has_raw_traces": true,
+  "mode": "full",
+  "dataset": "Debi_DRG",
+  "preprocessed_zarr": "/Users/leolopster/Desktop/KSLSpikeInference/preprocessed/Debi_DRG_nlm.zarr",
+  "roi_labels": "/Users/leolopster/Desktop/KSLSpikeInference/labels/Debi_DRG_ROI.tiff",
+  "START_TIMEPOINT": 0,
+  "EXTRACT_TIMEPOINTS": 300,
+  "BASELINE_SLIDES": 20
+}

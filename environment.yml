@@ -1,4 +1,4 @@
-name: cascadetorch
+name: cascade
 channels:
   - conda-forge
   - pytorch
@@ -14,7 +14,7 @@ dependencies:
   - seaborn
   - pyyaml
   # imaging / preprocessing pipeline (process_using_napari.ipynb,
-  # SlideBook_WF_Timelapse_Dask_Load.ipynb)
+  # spike_inference_gui.py, SlideBook_WF_Timelapse_Dask_Load.ipynb)
   - dask
   - scikit-image
   - scikit-learn
@@ -22,10 +22,21 @@ dependencies:
   - zarr
   - tqdm
   - networkx
+  # matplotlib writes the figure exports as .tiff through Pillow
+  # (analysis_tools/store.py: save_figure). Pulled in transitively by
+  # scikit-image today, but the GUI depends on it directly.
+  - pillow
   - pip:
     - torch
     - ruamel.yaml
-    # napari + a Qt6 backend for the notebooks' `%gui qt6` magic.
+    # napari + a Qt6 backend, for the notebooks' `%gui qt6` magic and for
+    # spike_inference_gui.py, which opens a napari viewer alongside its window.
+    # qtpy is napari's Qt abstraction layer; the GUI imports it directly
+    # (qtpy.QtCore / qtpy.QtWidgets), so it is declared rather than left to
+    # arrive as a napari dependency. Kept in the pip section with napari so the
+    # whole Qt stack resolves through one package manager.
+    - napari[pyqt6]
+    - qtpy
     # NOTE: SlideBook_API (used by SlideBook_WF_Timelapse_Dask_Load.ipynb) is a
     # local/vendor module, not on conda/PyPI -- install it separately.
-    - napari[pyqt6]
+    # NOTE: cascade2p is vendored in ./CascadeTorch, not installed from PyPI.
