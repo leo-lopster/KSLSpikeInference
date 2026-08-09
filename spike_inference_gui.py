@@ -6,7 +6,8 @@ napari opening alongside for the image and ROI work.
 
     python spike_inference_gui.py
 
-Every option comes from GUI_OPTIONS_SPEC.md and every file operation goes through
+Every option is documented in CascadeTorch/README.md (the "Local fork" section, which
+replaced GUI_OPTIONS_SPEC.md), and every file operation goes through
 analysis_tools/, so the GUI and the notebook share one implementation. Long jobs run on a
 worker thread and stream their stdout into the log pane at the bottom.
 
