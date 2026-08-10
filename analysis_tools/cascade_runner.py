@@ -11,14 +11,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
+import zipfile
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+from urllib.request import urlopen
 
 import numpy as np
 import yaml
 from scipy.signal import resample_poly
+
+# The pretrained models are NOT in the repository -- Pretrained_models/ ships only the
+# index below, and each model folder has to be downloaded before it can be selected.
+MODEL_INDEX = "available_models_CascadeTorch.yaml"
 
 
 # --------------------------------------------------------------------------- models
@@ -43,7 +50,101 @@ def model_rate_from_name(name):
 
 
 def available_models(model_dir):
-    return sorted(p.name for p in Path(model_dir).iterdir() if p.is_dir())
+    """Locally usable models: a folder is only listed once its config.yaml is there.
+
+    Presence of the folder alone is not enough -- an interrupted download leaves a
+    directory behind, and offering it in the model dropdown would fail deep inside
+    cascade.predict() rather than here.
+    """
+    model_dir = Path(model_dir)
+    return sorted(p.name for p in model_dir.iterdir()
+                  if p.is_dir() and not p.name.startswith(".")
+                  and (p / "config.yaml").exists())
+
+
+def is_installed(model_dir, name):
+    return (Path(model_dir) / name / "config.yaml").exists()
+
+
+def model_index(model_dir):
+    """{model_name: download link} read from the local availability index.
+
+    The index that ships in Pretrained_models/ is the authority here; nothing is
+    fetched to build this list, so the set of offered models is exactly what the file
+    in the repository says. Upstream re-downloads the index from GitHub before every
+    model download -- deliberately not done, because that silently overwrites a file
+    that is version-controlled here.
+    """
+    path = Path(model_dir) / MODEL_INDEX
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No {MODEL_INDEX} in {model_dir}; without it there is no list of models "
+            "to download from.")
+    with open(path) as f:
+        index = yaml.safe_load(f) or {}
+    return {name: entry["Link"] for name, entry in index.items() if entry.get("Link")}
+
+
+def download_model(model_dir, name, progress=None, chunk_bytes=1 << 18):
+    """Download one pretrained model from the index and unpack it into model_dir/name.
+
+    `progress` is an optional callback taking (bytes_done, bytes_total), matching
+    `traces.extract_roi_traces`; pass None in scripts.
+
+    An existing copy is replaced only after the new one has downloaded AND extracted
+    cleanly, so a failed re-download cannot destroy a model that was working.
+    """
+    model_dir = Path(model_dir)
+    link = model_index(model_dir).get(name)
+    if link is None:
+        raise ValueError(f"{name!r} is not in {MODEL_INDEX}; nothing to download from.")
+
+    staging = model_dir / f".downloading_{name}"
+    archive = model_dir / f".downloading_{name}.zip"
+    shutil.rmtree(staging, ignore_errors=True)
+    archive.unlink(missing_ok=True)
+
+    try:
+        print(f"> Downloading {name} <- {link}")
+        with urlopen(link) as response, open(archive, "wb") as f:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                block = response.read(chunk_bytes)
+                if not block:
+                    break
+                f.write(block)
+                done += len(block)
+                if progress is not None:
+                    progress(done, total or done)
+        print(f"> Downloaded {done / 1e6:.1f} MB, unpacking…")
+
+        if not zipfile.is_zipfile(archive):
+            raise ValueError(
+                f"What came back from the link for {name} is not a zip archive. The "
+                "index may be stale, or the host may have returned an error page.")
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(staging)
+
+        # The archives observed hold config.yaml + the .pth files flat at the root, but
+        # tolerate one wrapping directory rather than burying the model a level down.
+        contents = list(staging.iterdir())
+        if len(contents) == 1 and contents[0].is_dir():
+            staging = contents[0]
+        if not (staging / "config.yaml").exists():
+            raise ValueError(f"The archive for {name} contains no config.yaml "
+                             f"(found: {[p.name for p in staging.iterdir()][:5]}).")
+
+        destination = model_dir / name
+        shutil.rmtree(destination, ignore_errors=True)
+        staging.replace(destination)
+    finally:
+        archive.unlink(missing_ok=True)
+        shutil.rmtree(model_dir / f".downloading_{name}", ignore_errors=True)
+
+    n_weights = len(list(destination.glob("*.pth")))
+    print(f"> Installed {name}: {n_weights} weight file(s) -> {destination}")
+    return destination
 
 
 def describe_models(model_dir):

@@ -1,27 +1,38 @@
+# Environment for spike_inference_gui.py. GUI only -- the notebooks are not
+# supported on this branch, so nothing here is declared on their behalf.
 name: cascade
 channels:
   - conda-forge
-  - pytorch
-  - defaults
 dependencies:
+  # 3.10 is not incidental: it is what holds zarr at 2.x (see below), and napari
+  # + PyQt6 are only verified against it here.
   - python=3.10
+  # Needed at runtime, not just to install: CascadeTorch/cascade2p/config.py
+  # imports `pip._internal` at module level, so the CASCADE path fails without
+  # pip present in the env.
   - pip
   - numpy
-  - scipy
+  # cascade2p imports the deprecated scipy.ndimage.filters / .morphology
+  # namespaces (cascade2p/utils.py, utils_discrete_spikes.py, cascade.py).
+  # Those shims are documented for removal in SciPy 2.0 -- hold below it.
+  - scipy <2
   - matplotlib
   - pandas
-  - h5py
-  - seaborn
+  - seaborn        # cascade2p/utils.py calls sns.set() at import time
   - pyyaml
-  # imaging / preprocessing pipeline (process_using_napari.ipynb,
-  # spike_inference_gui.py, SlideBook_WF_Timelapse_Dask_Load.ipynb)
+  # imaging / preprocessing pipeline
   - dask
   - scikit-image
   - scikit-learn
   - tifffile
-  - zarr
-  - tqdm
-  - networkx
+  # zarr 3 requires Python >= 3.11, so the python=3.10 pin already implies 2.x --
+  # stated explicitly so a future Python bump cannot change the store format
+  # silently. The preprocessed .zarr caches on disk are v2.
+  - zarr <3
+  # tifffile delegates compressed-TIFF decoding to imagecodecs. ROI labels this
+  # codebase writes are uncompressed, but Fiji saves label images LZW by default
+  # and store.load_roi_labels raises "requires the 'imagecodecs' package" on one.
+  - imagecodecs
   # matplotlib writes the figure exports as .tiff through Pillow
   # (analysis_tools/store.py: save_figure). Pulled in transitively by
   # scikit-image today, but the GUI depends on it directly.
@@ -29,14 +40,11 @@ dependencies:
   - pip:
     - torch
     - ruamel.yaml
-    # napari + a Qt6 backend, for the notebooks' `%gui qt6` magic and for
-    # spike_inference_gui.py, which opens a napari viewer alongside its window.
-    # qtpy is napari's Qt abstraction layer; the GUI imports it directly
-    # (qtpy.QtCore / qtpy.QtWidgets), so it is declared rather than left to
-    # arrive as a napari dependency. Kept in the pip section with napari so the
-    # whole Qt stack resolves through one package manager.
+    # napari + a Qt6 backend: spike_inference_gui.py opens a napari viewer
+    # alongside its window. qtpy is napari's Qt abstraction layer; the GUI
+    # imports it directly (qtpy.QtCore / qtpy.QtWidgets), so it is declared
+    # rather than left to arrive as a napari dependency. Kept in the pip section
+    # with napari so the whole Qt stack resolves through one package manager.
     - napari[pyqt6]
     - qtpy
-    # NOTE: SlideBook_API (used by SlideBook_WF_Timelapse_Dask_Load.ipynb) is a
-    # local/vendor module, not on conda/PyPI -- install it separately.
     # NOTE: cascade2p is vendored in ./CascadeTorch, not installed from PyPI.

@@ -45,6 +45,11 @@ LAYER_RAW = "raw_stack"
 LAYER_PREPROCESSED = "preprocessed"
 LAYER_LABELS = "ROI labels"
 
+# Width floor for the tab-5 model dropdowns, in characters. The longest name in
+# Pretrained_models/available_models_CascadeTorch.yaml is 57 characters; below ~48 the
+# longest entries start to elide at the current font.
+MODEL_COMBO_CHARS = 58
+
 
 # =============================================================================
 # Session state
@@ -160,6 +165,22 @@ def _spin(lo, hi, value, step=1, decimals=None):
     box.setRange(lo, hi)
     box.setSingleStep(step)
     box.setValue(value)
+    return box
+
+
+def _combo(min_chars=MODEL_COMBO_CHARS):
+    """A dropdown that will not shrink below `min_chars` characters of text.
+
+    Two settings, because they do different things: the size-adjust policy fixes the
+    PREFERRED width (what QFormLayout grants when there is room), while the minimum
+    width is the actual floor -- without it Qt still squeezes the box back to ~103 px
+    and elides the names as soon as the window is narrowed.
+    """
+    box = QComboBox()
+    box.setMinimumContentsLength(min_chars)
+    box.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    box.setMinimumWidth(box.fontMetrics().horizontalAdvance("0" * min_chars) + 40)
     return box
 
 
@@ -955,7 +976,7 @@ class PipelineWindow(QMainWindow):
         self.cascade_dir_edit.setPlaceholderText("(none selected) — e.g. ./CascadeTorch")
         self.cascade_dir_edit.textChanged.connect(self._on_cascade_dir_changed)
         form.addRow("CASCADE_DIR", _path_row(self.cascade_dir_edit, self._browse_cascade_dir))
-        self.model_combo = QComboBox()
+        self.model_combo = _combo()
         self.model_combo.currentTextChanged.connect(self._describe_model)
         form.addRow("MODEL_NAME", self.model_combo)
         layout.addWidget(box)
@@ -967,6 +988,23 @@ class PipelineWindow(QMainWindow):
             "dorsal-horn model applied to DRG — the nearest available analogue, and an "
             "untested transfer (CLAUDE.md §4C, App. A §8). No DRG-specific ground truth "
             "exists; state this wherever the output is quoted."))
+
+        download_box = QGroupBox("Download pretrained models")
+        download_form = QFormLayout(download_box)
+        self.download_combo = _combo()
+        download_form.addRow("model", self.download_combo)
+        self.download_btn = QPushButton("Download selected model")
+        self.download_btn.clicked.connect(self._on_download_model)
+        download_form.addRow(self.download_btn)
+        self.download_info = _info()
+        download_form.addRow(self.download_info)
+        download_form.addRow(_caption(
+            "The repository ships no model weights — only the index of download links, "
+            "Pretrained_models/available_models_CascadeTorch.yaml. Downloaded models land "
+            "in CASCADE_DIR/Pretrained_models/<name>/ and appear in MODEL_NAME above. A "
+            "model is a few MB to tens of MB; the list is whatever that index file says, "
+            "nothing is fetched to build it."))
+        layout.addWidget(download_box)
 
         buttons = QHBoxLayout()
         self.run_cascade_btn = QPushButton("Run CASCADE")
@@ -1004,7 +1042,7 @@ class PipelineWindow(QMainWindow):
         self._reload_models()
         self._refresh_gating()
 
-    def _reload_models(self):
+    def _reload_models(self, select=None):
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         model_dir = self._model_dir()
@@ -1016,10 +1054,70 @@ class PipelineWindow(QMainWindow):
                 models = []
         self.model_combo.addItems(models)
         default = "Spinal_cord_excitatory_30Hz_smoothing50ms"
-        if default in models:
+        # `select` is the model just downloaded: pick it, so pressing Download and then
+        # Run CASCADE does what it looks like it does.
+        if select in models:
+            self.model_combo.setCurrentText(select)
+        elif default in models:
             self.model_combo.setCurrentText(default)
         self.model_combo.blockSignals(False)
+        self._reload_download_list(models)
         self._describe_model()
+
+    def _reload_download_list(self, installed):
+        """Fill the download dropdown from the index file, marking what is already here.
+
+        The model name is carried in the item's data rather than parsed back out of its
+        label, so the '✓ ' marker can never end up in a path.
+        """
+        self.download_combo.clear()
+        model_dir = self._model_dir()
+        if model_dir is None:
+            self.download_info.setText("Set CASCADE_DIR to list the downloadable models.")
+            return
+        try:
+            index = at.cascade_runner.model_index(model_dir)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            self.download_info.setText(f"No download index: {exc}")
+            return
+        for name in sorted(index):
+            here = name in installed
+            self.download_combo.addItem(f"{'✓ ' if here else ''}{name}", name)
+        # Models present on disk but absent from the index -- e.g. a hand-placed or
+        # retrained folder -- are usable but cannot be re-downloaded; say so rather than
+        # letting the two counts disagree silently.
+        unlisted = sorted(set(installed) - set(index))
+        note = f" · {len(unlisted)} local model(s) not in the index: {', '.join(unlisted)}" \
+            if unlisted else ""
+        self.download_info.setText(
+            f"<b>{len(installed)}</b> of <b>{len(index)}</b> listed model(s) "
+            f"installed{note}")
+
+    def _on_download_model(self):
+        model_dir = self._model_dir()
+        if model_dir is None:
+            return self._warn("Set CASCADE_DIR before downloading a model.")
+        name = self.download_combo.currentData()
+        if not name:
+            return self._warn("No model selected to download.")
+        if at.cascade_runner.is_installed(model_dir, name):
+            answer = QMessageBox.question(
+                self, "Already installed",
+                f"{name} is already in {model_dir.name}/.\n\n"
+                "Download it again and replace the local copy?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        model_dir.mkdir(parents=True, exist_ok=True)
+
+        def work(progress):
+            return at.cascade_runner.download_model(model_dir, name, progress=progress)
+
+        def done(path):
+            self._log(f"> Model ready -> {path}")
+            self._reload_models(select=name)
+            self._refresh_gating()
+
+        self._run(work, done, f"Downloading {name}…", with_progress=True)
 
     def _describe_model(self):
         name = self.model_combo.currentText()
@@ -1358,8 +1456,13 @@ class PipelineWindow(QMainWindow):
         # current tab makes Qt jump focus to the first enabled one, which dragged the
         # user to "4 · Traces" after every job; running jobs are blocked by disabling
         # the action buttons instead.
+        # Tab 5 is always available, unlike the stages around it: an empty
+        # Pretrained_models/ has to be fillable before there are any traces, and the
+        # tab holds the model downloader. A disabled tab disables its children, so
+        # gating it on has_traces made downloading impossible on a fresh clone. The
+        # actions inside it carry their own gates instead.
         current = self.tabs.currentIndex()
-        for index, enabled in enumerate([full, full, full, True, has_traces, has_rate]):
+        for index, enabled in enumerate([full, full, full, True, True, has_rate]):
             self.tabs.setTabEnabled(index, enabled)
         if self.tabs.isTabEnabled(current):
             self.tabs.setCurrentIndex(current)
@@ -1388,8 +1491,13 @@ class PipelineWindow(QMainWindow):
         # dialogs. Saving/loading traces still uses the derived <root>/<tag>.
         self.run_cascade_btn.setEnabled(idle and has_traces
                                         and bool(self.model_combo.currentText()))
+        # Downloading needs no traces and no ROIs -- it is how an empty Pretrained_models/
+        # gets its first model, so it stays available whatever else the session lacks.
+        self.download_btn.setEnabled(idle and self.download_combo.count() > 0)
         self.save_spike_btn.setEnabled(idle and self._cascade_result is not None)
-        self.load_spike_btn.setEnabled(idle)
+        # Needs traces for the same reason the tab used to: a rate loaded with no dF/F
+        # behind it unlocks tab 6, whose analysis reads dff_matrix and would crash on it.
+        self.load_spike_btn.setEnabled(idle and has_traces)
         self.run_analysis_btn.setEnabled(idle and has_rate)
         self._sync_derived_paths()
 
