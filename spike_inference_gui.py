@@ -13,11 +13,20 @@ worker thread and stream their stdout into the log pane at the bottom.
 
 Not included, deliberately: max/STD projection rendering. The ROI layer is therefore
 sized against the preprocessed stack itself rather than a projection layer.
+
+TEMPORARILY DISABLED: Index B (the frequency-domain PCA -- band powers and dominant
+frequency of the inferred rate). Tab 6 runs Index A only. Every disabled block is
+commented out behind the marker `[Index B disabled]`, so `grep -n "\\[Index B disabled\\]"`
+lists everything that has to be un-commented to bring it back. The library functions it
+used (`features.freq_features`, `features.describe_bands`, `features.freq_group_summary`,
+`grouping.compare_partitions`) are untouched and still work -- only the call sites here
+are switched off.
 """
 
 from __future__ import annotations
 
 import io
+import json
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -25,18 +34,25 @@ from pathlib import Path
 import time
 
 import matplotlib
-matplotlib.use("Agg")  # figures are exported to .tiff, never drawn into the Qt event loop
+matplotlib.use("Agg")  # no pyplot GUI backend; the live canvases are built explicitly
+from matplotlib.figure import Figure  # noqa: E402
 
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import napari  # noqa: E402
-from qtpy.QtCore import QObject, QRunnable, Qt, QThreadPool, Signal, Slot  # noqa: E402
-from qtpy.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QProgressBar, QPushButton, QSpinBox, QSplitter, QTabWidget, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
+from qtpy.QtCore import (  # noqa: E402
+    QEvent, QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot,
 )
+from qtpy.QtGui import QColor, QFontDatabase  # noqa: E402
+from qtpy.QtWidgets import (  # noqa: E402
+    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSlider,
+    QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
+)
+from superqt import QLabeledRangeSlider  # noqa: E402
 
 import analysis_tools as at  # noqa: E402
 
@@ -168,6 +184,53 @@ def _spin(lo, hi, value, step=1, decimals=None):
     return box
 
 
+class _Canvas(FigureCanvasQTAgg):
+    """A matplotlib canvas sized in inches, for the live preview.
+
+    Height is pinned rather than left to the layout because these live inside a scroll
+    area, which gives its child whatever height it asks for -- an unpinned canvas
+    collapses to nothing. `show_figure` swaps in a new figure and keeps the widget height
+    in step with it, so a group-traces figure that grows with k stays fully drawn instead
+    of being squeezed.
+
+    The background handling is not cosmetic. FigureCanvasQTAgg sets WA_OpaquePaintEvent,
+    promising Qt that it paints every pixel of the widget, and then paints its Agg buffer
+    from the top-left corner. The promise breaks the moment a figure smaller than the
+    widget is swapped in -- fewer groups means a shorter group-traces figure -- because
+    nothing repaints the margin around it and the PREVIOUS, larger figure stays on
+    screen behind the new one. Dropping that attribute and filling the background
+    instead makes Qt clear the whole widget before every paint.
+    """
+
+    DPI = 100
+
+    def __init__(self, height_inches):
+        super().__init__(Figure(figsize=(11, height_inches), dpi=self.DPI))
+        self.setMinimumHeight(int(height_inches * self.DPI))
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(self.backgroundRole(), QColor("white"))  # matches figure facecolor
+        self.setPalette(palette)
+
+    def show_figure(self, fig):
+        fig.set_dpi(self.DPI)
+        # Re-run the layout at draw time: the figure is about to be shown at the widget's
+        # width, which is not the figsize the plot function chose for export.
+        fig.set_layout_engine("tight")
+        self.figure = fig
+        fig.set_canvas(self)
+        # setFixedHeight, not setMinimumHeight: a minimum only lets the widget shrink if
+        # the layout chooses to, so going from k=10 to k=3 left a tall widget holding a
+        # short figure -- the empty band below it is where the old figure lingered.
+        self.setFixedHeight(max(1, int(round(fig.get_figheight() * self.DPI))))
+        self.draw_idle()
+
+    def clear(self):
+        self.figure.clear()
+        self.draw_idle()
+
+
 def _combo(min_chars=MODEL_COMBO_CHARS):
     """A dropdown that will not shrink below `min_chars` characters of text.
 
@@ -182,6 +245,37 @@ def _combo(min_chars=MODEL_COMBO_CHARS):
         QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     box.setMinimumWidth(box.fontMetrics().horizontalAdvance("0" * min_chars) + 40)
     return box
+
+
+def _form(parent):
+    """A QFormLayout whose fields fill the column instead of sitting at their sizeHint.
+
+    macOS is the only platform whose style defaults QFormLayout to
+    `FieldsStayAtSizeHint`, which hands each field exactly the width it asks for. For a
+    word-wrapped QLabel that width is a narrow heuristic -- the Zarr-cache status was
+    given 318 px for a message needing two lines, and rendered only the first, cutting it
+    mid-sentence. It also pinned the path fields to their minimum so they never grew with
+    the window. `AllNonFixedFieldsGrow` is what every other platform already does.
+    """
+    form = QFormLayout(parent)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    return form
+
+
+def _path_edit(placeholder):
+    """A path field wide enough to show its own placeholder.
+
+    A QLineEdit's default minimum width is a fixed character count with no relation to
+    what it holds, so these fields opened narrow enough to elide the example path they
+    exist to demonstrate. Measuring the placeholder and making that the floor keeps the
+    hint readable at any window width; the field still grows with the window, since
+    `_path_row` gives it the stretch.
+    """
+    edit = QLineEdit()
+    edit.setPlaceholderText(placeholder)
+    # + room for the frame and the text margins Qt puts either side of the content.
+    edit.setMinimumWidth(edit.fontMetrics().horizontalAdvance(placeholder) + 24)
+    return edit
 
 
 def _path_row(line_edit, on_browse, button_text="Browse…"):
@@ -208,6 +302,97 @@ def _caption(text):
     return label
 
 
+class _HelpIcon(QLabel):
+    """An 'i' badge that floats its explanation beside itself while hovered.
+
+    The explanatory notes used to sit permanently under the control they describe, which
+    made every panel mostly prose. They are still worth keeping verbatim -- several record
+    why a default is what it is -- so they move here rather than being cut.
+
+    A plain `setToolTip` would be less code, but Qt decides the wrap width itself and
+    hides the tip on a timer; these notes are whole paragraphs and are read while
+    comparing them against the control. This popup is a fixed width, wraps, and stays up
+    for exactly as long as the pointer is over the icon.
+    """
+
+    POPUP_WIDTH = 460
+
+    def __init__(self, text, parent=None):
+        super().__init__("ⓘ", parent)
+        self._text = " ".join(text.split())
+        self._popup = None
+        self.setCursor(Qt.CursorShape.WhatsThisCursor)
+        # palette(text), not palette(mid): the badge is the only thing advertising that an
+        # explanation exists, so it takes the palette's full-contrast foreground -- black
+        # on a light theme, white on a dark one -- rather than the muted grey the captions
+        # used when they were always on screen.
+        self.setStyleSheet("color: palette(text); font-size: 13px; font-weight: bold;")
+        # The text is still SET so assistive tech and anything querying toolTip() can read
+        # it, but `event` below swallows the render -- see there.
+        self.setToolTip(self._text)
+        self.setAccessibleDescription(self._text)
+
+    def event(self, event):
+        # Qt would raise its own tooltip on the usual delay, on top of the popup already
+        # showing the same words twice over. Consume the request: the popup IS this
+        # widget's tooltip, it just renders it wider and holds it for as long as hovered.
+        if event.type() == QEvent.Type.ToolTip:
+            return True
+        return super().event(event)
+
+    def enterEvent(self, event):
+        self._show_popup()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        if self._popup is not None:
+            self._popup.hide()
+        super().leaveEvent(event)
+
+    def _show_popup(self):
+        if self._popup is None:
+            popup = QLabel(self._text, self, Qt.WindowType.ToolTip)
+            popup.setWordWrap(True)
+            popup.setMargin(8)
+            popup.setFixedWidth(self.POPUP_WIDTH)
+            # Transparent to the mouse: the popup opens directly under the pointer's
+            # path, and if it took hover events it would trigger this icon's leaveEvent
+            # and flicker itself out of existence.
+            popup.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            popup.setStyleSheet(
+                "background: palette(base); color: palette(text);"
+                "border: 1px solid palette(mid); font-size: 11px;")
+            self._popup = popup
+        self._popup.adjustSize()
+        self._popup.move(self._popup_position())
+        self._popup.show()
+
+    def _popup_position(self):
+        """Below the icon, pulled back inside the screen when it would overhang."""
+        size = self._popup.size()
+        point = self.mapToGlobal(QPoint(0, self.height() + 4))
+        x, y = point.x(), point.y()
+        screen = self.screen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left() + 8, min(x, area.right() - size.width() - 8))
+            if y + size.height() > area.bottom():
+                y = self.mapToGlobal(QPoint(0, 0)).y() - size.height() - 4
+        return QPoint(x, y)
+
+
+def _help_label(name, help_text):
+    """A form-row label carrying an information icon: `name` + hover explanation."""
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+    layout.addWidget(QLabel(name))
+    layout.addWidget(_HelpIcon(help_text))
+    layout.addStretch(1)
+    return row
+
+
 # =============================================================================
 # Main window
 # =============================================================================
@@ -226,6 +411,14 @@ class PipelineWindow(QMainWindow):
         # is already saved somewhere, and re-saving it would only duplicate it.
         self._cascade_result = None
         self._cascade_extra = None
+        # The last previewed feature/PCA/tree bundle. Held so the k sliders can re-cut
+        # without recomputing, and dropped the moment any setting behind it changes.
+        self._preview = None
+        self._analysis_parent_dir = None  # asked once, reused for every run subfolder
+        self._region_touched = False      # until dragged, the region is the whole recording
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.timeout.connect(self._redraw_preview)
 
         self.setWindowTitle("Spike Inference Pipeline")
         self.resize(760, 940)
@@ -240,7 +433,14 @@ class PipelineWindow(QMainWindow):
 
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setMaximumBlockCount(5000)
-        self.log.setStyleSheet("font-family: monospace; font-size: 11px;")
+        # Ask Qt for the platform's fixed-width font (Menlo here) rather than naming a
+        # "monospace" family in a stylesheet. No system ships a family by that literal
+        # name, so Qt falls back to scanning every installed font to build its alias
+        # table -- a ~60 ms startup cost that prints
+        # 'Populating font family aliases took N ms ... missing font family "Monospace"'.
+        log_font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        log_font.setPointSize(10)
+        self.log.setFont(log_font)
 
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -273,19 +473,19 @@ class PipelineWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        box = QGroupBox("Dataset (point 1 — .npy frames from an .imgdir)")
-        form = QFormLayout(box)
-        self.data_dir_edit = QLineEdit()
-        self.data_dir_edit.setPlaceholderText("(none selected) — e.g. ./datasets/<name>.imgdir")
+        box = QGroupBox("Dataset (.npy frames from an .imgdir)")
+        form = _form(box)
+        self.data_dir_edit = _path_edit("e.g. ./datasets/<name>.imgdir")
         self.data_dir_edit.textChanged.connect(self._refresh_gating)
-        form.addRow("Data Directory", _path_row(self.data_dir_edit, self._browse_data_dir))
+        form.addRow("Raw Data Directory", _path_row(self.data_dir_edit, self._browse_data_dir))
         self.channel_spin = _spin(0, 8, 0)
-        form.addRow("Calcium Indicator Channel", self.channel_spin)
+        form.addRow("Use Channel...", self.channel_spin)
         self.fallback_hz_spin = _spin(0.01, 10000.0, 10.0, 0.5, decimals=2)
-        form.addRow("Fallback Freq. (Hz)", self.fallback_hz_spin)
-        form.addRow(_caption("fallback_hz is used only when ElapsedTimes.yaml is missing or "
-                             "its length disagrees with the stack. The warning appears in "
-                             "the log — do not ignore it."))
+        form.addRow(_help_label(
+            "Fallback Freq. (Hz)",
+            "fallback_hz is used only when ElapsedTimes.yaml is missing or its length "
+            "disagrees with the stack. The warning appears in the log — do not ignore "
+            "it."), self.fallback_hz_spin)
         layout.addWidget(box)
 
         self.load_dataset_btn = QPushButton("Load dataset")
@@ -337,7 +537,7 @@ class PipelineWindow(QMainWindow):
         layout = QVBoxLayout(page)
 
         box = QGroupBox("Denoise chain")
-        form = QFormLayout(box)
+        form = _form(box)
         self.denoise_checks = {}
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -351,9 +551,10 @@ class PipelineWindow(QMainWindow):
             self.denoise_checks[name] = check
             row_layout.addWidget(check)
         row_layout.addStretch(1)
-        form.addRow("Denoise Method", row)
-        # form.addRow(_caption("Applied in sequence, in the fixed order gaussian → nlm → dct.")) ## DCT is Deprecated
-        form.addRow(_caption("Applied in sequence, in the fixed order gaussian → nlm"))
+        form.addRow(_help_label(
+            "Denoise Method",
+            # "Applied in sequence, in the fixed order gaussian → nlm → dct."  ## DCT is Deprecated
+            "Applied in sequence, in the fixed order gaussian → nlm."), row)
 
         self.sigma_spin = _spin(0.0, 50.0, 3.0, 0.1, decimals=2)
         form.addRow("[Gaussian] Sigma", self.sigma_spin)
@@ -372,17 +573,17 @@ class PipelineWindow(QMainWindow):
         layout.addWidget(box)
 
         io_box = QGroupBox("Zarr cache")
-        io_form = QFormLayout(io_box)
-        self.preprocessed_dir_edit = QLineEdit()
-        self.preprocessed_dir_edit.setPlaceholderText("(none selected) — e.g. ./preprocessed")
+        io_form = _form(io_box)
+        self.preprocessed_dir_edit = _path_edit("e.g. ./preprocessed")
         self.preprocessed_dir_edit.textChanged.connect(self._refresh_gating)
-        io_form.addRow("PREPROCESSED_DIR",
+        io_form.addRow("Preprocessed Data Directory",
                        _path_row(self.preprocessed_dir_edit, self._browse_preprocessed_dir))
         self.zarr_info = _info()
-        io_form.addRow("resolved path", self.zarr_info)
-        io_form.addRow(_caption("The denoise chain is part of the filename. Changing it "
-                                "retargets which store is saved AND loaded — check the "
-                                "resolved path before pressing anything."))
+        io_form.addRow(_help_label(
+            "resolved path",
+            "Preprocess (denoise) methods are indicated in the filename. Changing it retargets which store "
+            "is saved AND loaded — check the resolved path before pressing anything."),
+            self.zarr_info)
         layout.addWidget(io_box)
 
         buttons = QHBoxLayout()
@@ -392,12 +593,20 @@ class PipelineWindow(QMainWindow):
         self.save_zarr_btn.clicked.connect(self._on_save_zarr)
         self.load_zarr_btn = QPushButton("Load from Zarr")
         self.load_zarr_btn.clicked.connect(self._on_load_zarr)
-        for button in (self.build_btn, self.save_zarr_btn, self.load_zarr_btn):
+
+        # Build new .zarr
+        buttons.addWidget(self.build_btn)
+        buttons.addWidget(_HelpIcon(
+            "‘Build lazy stack’ only wires the chain up and shows it in napari; nothing is "
+            "computed until napari draws a frame or you save. Saving computes every frame "
+            "and is slow."))
+
+        # Save/Load .zarr
+        for button in (self.save_zarr_btn, self.load_zarr_btn):
             buttons.addWidget(button)
+        
+        buttons.addStretch(1)
         layout.addLayout(buttons)
-        layout.addWidget(_caption("‘Build lazy stack’ only wires the chain up and shows it in "
-                                  "napari; nothing is computed until napari draws a frame or "
-                                  "you save. Saving computes every frame and is slow."))
         layout.addStretch(1)
         return page
 
@@ -424,13 +633,21 @@ class PipelineWindow(QMainWindow):
         )
 
     def _zarr_path(self):
+        """Where the current dataset + denoise chain would be cached, or None.
+
+        Gated on `dataset_tag`, not on `data_dir`: a .zarr loaded on its own is a complete
+        entry point and carries its tag in its filename, with no .imgdir behind it.
+        Requiring data_dir here left the resolved path blank for exactly that route --
+        the one case where the store is already known.
+        """
         method = self._denoise_method()
-        if not (self.session.data_dir and method):
+        tag = self.session.dataset_tag
+        if not (tag and method):
             return None
         out_dir = self._dir(self.preprocessed_dir_edit)
         if out_dir is None:
             return None
-        return out_dir / f"{self.session.dataset_tag}_{at.store.method_tag(method)}.zarr"
+        return out_dir / f"{tag}_{at.store.method_tag(method)}.zarr"
 
     def _on_build_stack(self):
         params = self._preprocess_params()
@@ -582,15 +799,16 @@ class PipelineWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        box = QGroupBox("ROI labels (point 2 — uint16 .tiff label image)")
-        form = QFormLayout(box)
-        self.labels_dir_edit = QLineEdit()
-        self.labels_dir_edit.setPlaceholderText("(none selected) — e.g. ./labels")
+        box = QGroupBox("ROI labels (uint16 .tiff label image)")
+        form = _form(box)
+        self.labels_dir_edit = _path_edit("e.g. ./labels")
         self.labels_dir_edit.textChanged.connect(self._refresh_gating)
-        form.addRow("LABELS_DIR", _path_row(self.labels_dir_edit, self._browse_labels_dir))
-        form.addRow(_caption("LABELS_DIR only sets where the load/save dialogs open. The labels "
-                             "path itself is chosen in those dialogs and recorded with the "
-                             "traces, so it always reflects the file actually used."))
+        form.addRow(_help_label(
+            "Labels Directory",
+            "Labels Directory (LABELS_DIR) only sets where the load/save dialogs open. The labels path itself "
+            "is chosen in those dialogs and recorded with the traces, so it always reflects "
+            "the file actually used."),
+            _path_row(self.labels_dir_edit, self._browse_labels_dir))
         layout.addWidget(box)
 
         buttons = QHBoxLayout()
@@ -602,14 +820,15 @@ class PipelineWindow(QMainWindow):
         self.load_labels_btn.clicked.connect(self._on_load_labels)
         for button in (self.new_labels_btn, self.save_labels_btn, self.load_labels_btn):
             buttons.addWidget(button)
+        buttons.addWidget(_HelpIcon(
+            "Paint ROIs on the 'ROI labels' layer in napari with the brush tool; press M for "
+            "a fresh label id per ROI. The labels are sized against the preprocessed stack — "
+            "this build renders no max/STD projection."))
+        buttons.addStretch(1)
         layout.addLayout(buttons)
 
         self.roi_info = _info("No ROI labels loaded.")
         layout.addWidget(self.roi_info)
-        layout.addWidget(_caption(
-            "Paint ROIs on the 'ROI labels' layer in napari with the brush tool; press M for a "
-            "fresh label id per ROI. The labels are sized against the preprocessed stack — this "
-            "build renders no max/STD projection."))
         layout.addStretch(1)
         return page
 
@@ -711,33 +930,33 @@ class PipelineWindow(QMainWindow):
         layout = QVBoxLayout(page)
 
         self.extract_box = QGroupBox("Extract dF/F from a preprocessed .zarr store")
-        form = QFormLayout(self.extract_box)
-        self.extract_zarr_edit = QLineEdit()
-        self.extract_zarr_edit.setPlaceholderText("(none selected) — <dataset_tag>_<method>.zarr")
+        form = _form(self.extract_box)
+        self.extract_zarr_edit = _path_edit("(none selected) — <dataset_tag>_<method>.zarr")
         self.extract_zarr_edit.textChanged.connect(self._refresh_gating)
-        form.addRow("source .zarr", _path_row(self.extract_zarr_edit, self._browse_extract_zarr))
-        form.addRow(_caption("Traces are read from this store on disk, not from whatever is "
-                             "currently in the viewer. Filled in automatically when a store is "
-                             "loaded or saved in tab 2; override it here to extract from a "
-                             "different preprocessing run."))
+        form.addRow(_help_label(
+            "source .zarr",
+            "Traces are read from this store on disk, not from whatever is currently in the "
+            "viewer. Filled in automatically when a store is loaded or saved in tab 2; "
+            "override it here to extract from a different preprocessing run."),
+            _path_row(self.extract_zarr_edit, self._browse_extract_zarr))
         self.start_spin = _spin(0, 10_000_000, 0)
         form.addRow("START_TIMEPOINT", self.start_spin)
         self.extract_spin = _spin(1, 10_000_000, 500)
         form.addRow("EXTRACT_TIMEPOINTS", self.extract_spin)
         self.baseline_spin = _spin(1, 10_000_000, 20)
-        form.addRow("BASELINE_SLIDES", self.baseline_spin)
-        form.addRow(_caption("F0 is the mean of the first BASELINE_SLIDES frames, so dF/F is ~0 "
-                             "there by construction. Keep the analysis 'pre' phase after that "
-                             "window (tab 6)."))
+        form.addRow(_help_label(
+            "BASELINE_SLIDES",
+            "F0 is the mean of the first BASELINE_SLIDES frames, so dF/F is ~0 there by "
+            "construction. Keep the analysis 'pre' phase after that window (tab 6)."),
+            self.baseline_spin)
         self.extract_btn = QPushButton("Extract traces")
         self.extract_btn.clicked.connect(self._on_extract)
         form.addRow(self.extract_btn)
         layout.addWidget(self.extract_box)
 
-        export_box = QGroupBox("Export / reload (points 3 and 4)")
+        export_box = QGroupBox("Export / reload")
         export_layout = QVBoxLayout(export_box)
-        self.analysis_dir_edit = QLineEdit()
-        self.analysis_dir_edit.setPlaceholderText("(none selected) — e.g. ./analysis")
+        self.analysis_dir_edit = _path_edit("(none selected) — e.g. ./analysis")
         self.analysis_dir_edit.textChanged.connect(self._refresh_gating)
         export_layout.addWidget(QLabel("Analysis root (outputs go to <root>/<dataset_tag>/)"))
         export_layout.addWidget(_path_row(self.analysis_dir_edit, self._browse_analysis_dir))
@@ -751,8 +970,8 @@ class PipelineWindow(QMainWindow):
         export_layout.addLayout(buttons)
         layout.addWidget(export_box)
 
-        import_box = QGroupBox("Traces-only entry — import dF/F from anywhere (point 3)")
-        import_form = QFormLayout(import_box)
+        import_box = QGroupBox("Traces-only entry — import dF/F from anywhere")
+        import_form = _form(import_box)
         self.import_path_edit = QLineEdit()
         self.import_path_edit.textChanged.connect(self._refresh_gating)
         import_form.addRow("file", _path_row(self.import_path_edit, self._browse_import))
@@ -762,11 +981,13 @@ class PipelineWindow(QMainWindow):
         self.time_column_edit = QLineEdit("auto")
         import_form.addRow("time_column", self.time_column_edit)
         self.import_rate_spin = _spin(0.0, 100000.0, 0.0, 0.5, decimals=3)
-        import_form.addRow("frame_rate_hz", self.import_rate_spin)
-        import_form.addRow(_caption(
+        import_form.addRow(_help_label(
+            "frame_rate_hz",
             "Required (non-zero) when the file carries no time axis — it cannot be inferred, "
-            "and CASCADE resampling, the phase windows and the frequency bands all depend on "
-            "it. Importing disables tabs 1–3: there is no pixel data behind these traces."))
+            "and CASCADE resampling and the phase windows both depend on "
+            # [Index B disabled] "the frequency bands" also depended on it
+            "it. Importing disables tabs 1–3: there is no pixel data behind these traces."),
+            self.import_rate_spin)
         self.import_btn = QPushButton("Import dF/F (switches to traces-only mode)")
         self.import_btn.clicked.connect(self._on_import_dff)
         import_form.addRow(self.import_btn)
@@ -971,39 +1192,38 @@ class PipelineWindow(QMainWindow):
         layout = QVBoxLayout(page)
 
         box = QGroupBox("CASCADE")
-        form = QFormLayout(box)
-        self.cascade_dir_edit = QLineEdit()
-        self.cascade_dir_edit.setPlaceholderText("(none selected) — e.g. ./CascadeTorch")
+        form = _form(box)
+        self.cascade_dir_edit = _path_edit("(none selected) — e.g. ./CascadeTorch")
         self.cascade_dir_edit.textChanged.connect(self._on_cascade_dir_changed)
         form.addRow("CASCADE_DIR", _path_row(self.cascade_dir_edit, self._browse_cascade_dir))
         self.model_combo = _combo()
         self.model_combo.currentTextChanged.connect(self._describe_model)
-        form.addRow("MODEL_NAME", self.model_combo)
+        form.addRow(_help_label(
+            "MODEL_NAME",
+            "Model choice is a scientific claim, not a preference. The default is a spinal "
+            "dorsal-horn model applied to DRG — the nearest available analogue, and an "
+            "untested transfer (CLAUDE.md §4C, App. A §8). No DRG-specific ground truth "
+            "exists; state this wherever the output is quoted."), self.model_combo)
         layout.addWidget(box)
 
         self.model_info = _info()
         layout.addWidget(self.model_info)
-        layout.addWidget(_caption(
-            "Model choice is a scientific claim, not a preference. The default is a spinal "
-            "dorsal-horn model applied to DRG — the nearest available analogue, and an "
-            "untested transfer (CLAUDE.md §4C, App. A §8). No DRG-specific ground truth "
-            "exists; state this wherever the output is quoted."))
 
         download_box = QGroupBox("Download pretrained models")
-        download_form = QFormLayout(download_box)
+        download_form = _form(download_box)
         self.download_combo = _combo()
-        download_form.addRow("model", self.download_combo)
+        download_form.addRow(_help_label(
+            "model",
+            "The repository ships no model weights — only the index of download links, "
+            "Pretrained_models/available_models_CascadeTorch.yaml. Downloaded models land "
+            "in CASCADE_DIR/Pretrained_models/<name>/ and appear in MODEL_NAME above. A "
+            "model is a few MB to tens of MB; the list is whatever that index file says, "
+            "nothing is fetched to build it."), self.download_combo)
         self.download_btn = QPushButton("Download selected model")
         self.download_btn.clicked.connect(self._on_download_model)
         download_form.addRow(self.download_btn)
         self.download_info = _info()
         download_form.addRow(self.download_info)
-        download_form.addRow(_caption(
-            "The repository ships no model weights — only the index of download links, "
-            "Pretrained_models/available_models_CascadeTorch.yaml. Downloaded models land "
-            "in CASCADE_DIR/Pretrained_models/<name>/ and appear in MODEL_NAME above. A "
-            "model is a few MB to tens of MB; the list is whatever that index file says, "
-            "nothing is fetched to build it."))
         layout.addWidget(download_box)
 
         buttons = QHBoxLayout()
@@ -1015,12 +1235,13 @@ class PipelineWindow(QMainWindow):
         self.load_spike_btn.clicked.connect(self._on_load_spike_rate)
         buttons.addWidget(self.run_cascade_btn)
         buttons.addWidget(self.save_spike_btn)
-        buttons.addWidget(self.load_spike_btn)
-        layout.addLayout(buttons)
-        layout.addWidget(_caption(
+        buttons.addWidget(_HelpIcon(
             "Saving asks for the destination folder each time rather than writing to the "
             "analysis root automatically, so a second run cannot overwrite the "
             "spike_rate.npy of an earlier one for the same dataset."))
+        buttons.addWidget(self.load_spike_btn)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
 
         self.inference_info = _info("No inferred rate.")
         layout.addWidget(self.inference_info)
@@ -1228,6 +1449,8 @@ class PipelineWindow(QMainWindow):
                 f"The saved rate has {spike_rate.shape[0]} ROIs but the current traces have "
                 f"{len(s.roi_ids)}. They are from different runs — reload matching traces.")
         s.spike_rate, s.pad = spike_rate, pad
+        self._sync_region_bounds()
+        self._invalidate_preview()
         self.inference_info.setText(
             f"Inferred rate <b>{spike_rate.shape[0]}</b> ROI(s) × "
             f"<b>{spike_rate.shape[1]}</b> frames · {pad} NaN pad frame(s) per end · "
@@ -1236,39 +1459,69 @@ class PipelineWindow(QMainWindow):
 
     # ------------------------------------------------------------------ tab 6
     def _build_analysis_tab(self):
+        """Tab 6 is itself split: 'Setup' holds the controls, 'Live preview' the canvases."""
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        self.analysis_tabs = QTabWidget()
+        self.analysis_tabs.addTab(self._build_analysis_setup(), "Setup")
+        self.analysis_tabs.addTab(self._build_preview_page(), "Live preview")
+        page_layout.addWidget(self.analysis_tabs)
+        return page
+
+    def _build_analysis_setup(self):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        phase_box = QGroupBox("Stimulus phases (s)")
-        phase_layout = QVBoxLayout(phase_box)
-        self.phase_table = QTableWidget(3, 3)
-        self.phase_table.setHorizontalHeaderLabels(["name", "start", "end"])
-        for row, (name, start, end) in enumerate(
-                [("pre", 2.0, 10.0), ("stim", 10.0, 15.0), ("post", 15.0, 50.0)]):
-            for col, value in enumerate((name, start, end)):
-                self.phase_table.setItem(row, col, QTableWidgetItem(str(value)))
-        self.phase_table.setMaximumHeight(140)
-        phase_layout.addWidget(self.phase_table)
-        phase_layout.addWidget(_caption(
-            "'pre' starts after the F0 window, not at 0: frames 0..BASELINE_SLIDES defined F0, "
-            "so dF/F there is ~0 by construction and would fake a silent baseline."))
-        layout.addWidget(phase_box)
+        # --- analysis window: phases OR one region, never both on screen at once ------
+        window_box = QGroupBox("Analysis window")
+        window_layout = QVBoxLayout(window_box)
+        mode_row = QHBoxLayout()
+        self.phase_mode_radio = QRadioButton("Chop up into phases")
+        self.region_mode_radio = QRadioButton("Select a region")
+        self.phase_mode_radio.setChecked(True)
+        self.window_mode_group = QButtonGroup(self)
+        self.window_mode_group.addButton(self.phase_mode_radio, 0)
+        self.window_mode_group.addButton(self.region_mode_radio, 1)
+        mode_row.addWidget(self.phase_mode_radio)
+        mode_row.addWidget(_HelpIcon(
+            "Phases are cut from the whole recording. The first phase doubles as the "
+            "ACTIVE_THRESH baseline, so start it after the F0 window, not at 0: frames "
+            "0..BASELINE_SLIDES defined F0, so dF/F there is ~0 by construction and would "
+            "fake a silent baseline."))
+        mode_row.addSpacing(16)
+        mode_row.addWidget(self.region_mode_radio)
+        mode_row.addWidget(_HelpIcon(
+            "The analysis runs on this window only, as a single phase. ACTIVE_THRESH is "
+            "measured BEFORE the region rather than inside it — a threshold taken from the "
+            "window being tested is set by the response it is meant to detect."))
+        mode_row.addStretch(1)
+        window_layout.addLayout(mode_row)
 
-        band_box = QGroupBox("Index B frequency bands (Hz)")
-        band_layout = QVBoxLayout(band_box)
-        self.band_table = QTableWidget(4, 2)
-        self.band_table.setHorizontalHeaderLabels(["low", "high"])
-        for row, (lo, hi) in enumerate([(0.2, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0)]):
-            self.band_table.setItem(row, 0, QTableWidgetItem(str(lo)))
-            self.band_table.setItem(row, 1, QTableWidgetItem(str(hi)))
-        self.band_table.setMaximumHeight(160)
-        band_layout.addWidget(self.band_table)
-        self.band_caption = _caption("")
-        band_layout.addWidget(self.band_caption)
-        layout.addWidget(band_box)
+        self.window_stack = QStackedWidget()
+        self.window_stack.addWidget(self._build_phase_page())
+        self.window_stack.addWidget(self._build_region_page())
+        self.window_mode_group.idToggled.connect(self._on_window_mode_changed)
+        window_layout.addWidget(self.window_stack)
+        layout.addWidget(window_box)
+
+        # [Index B disabled] the frequency-band table -- the only consumer of the bands
+        # was freq_features, so with Index B off there is nothing to configure here.
+        # band_box = QGroupBox("Index B frequency bands (Hz)")
+        # band_layout = QVBoxLayout(band_box)
+        # self.band_table = QTableWidget(4, 2)
+        # self.band_table.setHorizontalHeaderLabels(["low", "high"])
+        # for row, (lo, hi) in enumerate([(0.2, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 5.0)]):
+        #     self.band_table.setItem(row, 0, QTableWidgetItem(str(lo)))
+        #     self.band_table.setItem(row, 1, QTableWidgetItem(str(hi)))
+        # self.band_table.setMaximumHeight(160)
+        # band_layout.addWidget(self.band_table)
+        # self.band_caption = _caption("")
+        # band_layout.addWidget(self.band_caption)
+        # layout.addWidget(band_box)
 
         opts_box = QGroupBox("Thresholds, PCA and clustering")
-        form = QFormLayout(opts_box)
+        form = _form(opts_box)
         self.auto_thresh_check = QCheckBox("auto (baseline median + n·σ)")
         self.auto_thresh_check.setChecked(True)
         self.auto_thresh_check.stateChanged.connect(
@@ -1281,33 +1534,282 @@ class PipelineWindow(QMainWindow):
         form.addRow("ACTIVE_N_SIGMA", self.n_sigma_spin)
         self.var_target_spin = _spin(0.05, 1.0, 0.95, 0.01, decimals=2)
         form.addRow("PCA_VAR_TARGET", self.var_target_spin)
-        self.max_k_spin = _spin(2, 50, 8)
+        self.max_k_spin = _spin(2, 50, 12)
+        self.max_k_spin.valueChanged.connect(self._on_max_k_changed)
         form.addRow("MAX_K", self.max_k_spin)
         self.min_group_spin = _spin(1, 100, 3)
         form.addRow("MIN_GROUP_SIZE", self.min_group_spin)
         self.max_frac_spin = _spin(0.1, 1.0, 0.9, 0.05, decimals=2)
         form.addRow("MAX_GROUP_FRAC", self.max_frac_spin)
-        self.rate_cut_edit = QLineEdit()
-        self.rate_cut_edit.setPlaceholderText("blank = auto (suggest_cut)")
-        form.addRow("RATE_CUT_HEIGHT", self.rate_cut_edit)
-        self.freq_cut_edit = QLineEdit()
-        self.freq_cut_edit.setPlaceholderText("blank = auto (suggest_cut)")
-        form.addRow("FREQ_CUT_HEIGHT", self.freq_cut_edit)
         layout.addWidget(opts_box)
 
+        cluster_box = QGroupBox("Cluster count")
+        cluster_form = _form(cluster_box)
+        self.rate_k_slider, self.rate_k_label = self._k_slider("rate")
+        cluster_form.addRow(_help_label(
+            "Index A groups (k)",
+            "k cuts the tree with fcluster(maxclust); the equivalent height is shown beside "
+            "the slider and written to analysis_params.json, so k-specified runs stay "
+            "comparable with height-specified ones. Fill an override to pin a height "
+            "instead — it then takes precedence over k."),
+            self._k_row(self.rate_k_slider, self.rate_k_label))
+        # [Index B disabled] second k slider and its height override
+        # self.freq_k_slider, self.freq_k_label = self._k_slider("freq")
+        # cluster_form.addRow("Index B groups (k)", self._k_row(self.freq_k_slider,
+        #                                                       self.freq_k_label))
+        self.rate_cut_edit = QLineEdit()
+        self.rate_cut_edit.setPlaceholderText("blank = use k above")
+        cluster_form.addRow("RATE_CUT_HEIGHT override", self.rate_cut_edit)
+        # [Index B disabled]
+        # self.freq_cut_edit = QLineEdit()
+        # self.freq_cut_edit.setPlaceholderText("blank = use k above")
+        # cluster_form.addRow("FREQ_CUT_HEIGHT override", self.freq_cut_edit)
+        layout.addWidget(cluster_box)
+
+        buttons = QHBoxLayout()
+        self.preview_btn = QPushButton("Preview (no files written)")
+        self.preview_btn.clicked.connect(self._on_preview_analysis)
         self.run_analysis_btn = QPushButton("Run analysis and export (CSV + TIFF)")
         self.run_analysis_btn.clicked.connect(self._on_run_analysis)
-        layout.addWidget(self.run_analysis_btn)
+        buttons.addWidget(self.preview_btn)
+        buttons.addWidget(_HelpIcon(
+            "Preview computes the features, PCA and tree and draws them in the Live preview "
+            "tab without writing anything; k can then be dragged with no recomputation."))
+        buttons.addWidget(self.run_analysis_btn)
+        buttons.addWidget(_HelpIcon(
+            "Exporting asks once for a parent folder and writes an auto-named subfolder per "
+            "run, so configurations never overwrite each other. Group labels are an "
+            "arbitrary integer labelling, not a cell type."))
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
         self.analysis_info = _info("Not run.")
         layout.addWidget(self.analysis_info)
-        layout.addWidget(_caption(
-            "Running asks for an output folder first; figures are written as .tiff into "
-            "<that folder>/figures/ rather than drawn here. Group labels are an arbitrary "
-            "integer labelling, not a cell type."))
         layout.addStretch(1)
         return page
 
+    def _build_phase_page(self):
+        page = QWidget()
+        phase_layout = QVBoxLayout(page)
+        phase_layout.setContentsMargins(0, 0, 0, 0)
+        self.phase_table = QTableWidget(3, 3)
+        self.phase_table.setHorizontalHeaderLabels(["name", "start", "end"])
+        for row, (name, start, end) in enumerate(
+                [("pre", 2.0, 10.0), ("injury", 10.0, 15.0), ("post", 15.0, 50.0)]):
+            for col, value in enumerate((name, start, end)):
+                self.phase_table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.phase_table.setMaximumHeight(160)
+        self.phase_table.itemChanged.connect(self._invalidate_preview)
+        phase_layout.addWidget(self.phase_table)
+
+        row_buttons = QHBoxLayout()
+        add_btn = QPushButton("Add phase")
+        add_btn.clicked.connect(self._on_add_phase_row)
+        remove_btn = QPushButton("Remove selected")
+        remove_btn.clicked.connect(self._on_remove_phase_row)
+        row_buttons.addWidget(add_btn)
+        row_buttons.addWidget(remove_btn)
+        row_buttons.addStretch(1)
+        phase_layout.addLayout(row_buttons)
+        return page
+
+    def _build_region_page(self):
+        page = QWidget()
+        region_layout = QVBoxLayout(page)
+        region_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.region_slider = QLabeledRangeSlider(Qt.Orientation.Horizontal)
+        self.region_slider.setRange(0, 1)
+        self.region_slider.setValue((0, 1))
+        self.region_slider.valueChanged.connect(self._on_region_changed)
+        region_layout.addWidget(self.region_slider)
+
+        spin_row = QHBoxLayout()
+        self.region_start_spin = _spin(0, 10_000_000, 0)
+        self.region_end_spin = _spin(0, 10_000_000, 1)
+        for label, box in (("start frame", self.region_start_spin),
+                           ("end frame", self.region_end_spin)):
+            spin_row.addWidget(QLabel(label))
+            spin_row.addWidget(box)
+            box.valueChanged.connect(self._on_region_spin_changed)
+        spin_row.addStretch(1)
+        region_layout.addLayout(spin_row)
+
+        self.region_info = _info("Load an inferred rate to set the region.")
+        region_layout.addWidget(self.region_info)
+        # [Index B disabled] the region note (now on the mode radio) also warned that a
+        # band narrower than the FFT bin width (frame rate / frames) is refused.
+        return page
+
+    def _k_slider(self, which):
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(2, self.max_k_spin.value() if hasattr(self, "max_k_spin") else 12)
+        slider.setValue(4)
+        slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        label = QLabel("k=4")
+        slider.valueChanged.connect(lambda _v, w=which: self._on_k_changed(w))
+        return slider, label
+
+    @staticmethod
+    def _k_row(slider, label):
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(slider, 1)
+        label.setMinimumWidth(150)
+        row_layout.addWidget(label)
+        return row
+
+    def _build_preview_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        header = QHBoxLayout()
+        self.preview_index_combo = QComboBox()
+        self.preview_index_combo.addItem("Index A — inferred rate", "rate")
+        # [Index B disabled] with one entry left the combo has nothing to switch between,
+        # so it is hidden rather than shown as a dropdown that cannot drop.
+        # self.preview_index_combo.addItem("Index B — frequency", "freq")
+        self.preview_index_combo.currentIndexChanged.connect(lambda _i: self._redraw_preview())
+        self.preview_index_combo.setVisible(False)
+        header.addWidget(QLabel("Showing <b>Index A</b> — inferred rate "
+                                "(Index B is disabled in this build)"))
+        header.addStretch(1)
+        layout.addLayout(header)
+
+        self.preview_status = _info("Press ‘Preview’ in the Setup tab.")
+        layout.addWidget(self.preview_status)
+
+        self.preview_dendrogram = _Canvas(4.6)
+        self.preview_scatter = _Canvas(4.6)
+        self.preview_traces = _Canvas(6.0)
+        self.preview_explainer = _caption("")
+
+        inner = QWidget()
+        inner_layout = QVBoxLayout(inner)
+        inner_layout.addWidget(self.preview_dendrogram)
+        inner_layout.addWidget(self.preview_scatter)
+        inner_layout.addWidget(self.preview_explainer)
+        inner_layout.addWidget(self.preview_traces)
+        inner_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+        return page
+
+    # --- tab 6 window mode ----------------------------------------------------------
+    def _on_window_mode_changed(self, index, checked):
+        if not checked:
+            return
+        self.window_stack.setCurrentIndex(index)
+        self._sync_region_bounds()
+        self._invalidate_preview()
+
+    def _region_mode(self):
+        return self.region_mode_radio.isChecked()
+
+    def _on_add_phase_row(self):
+        row = self.phase_table.rowCount()
+        self.phase_table.insertRow(row)
+        for col, value in enumerate((f"phase{row + 1}", 0.0, 0.0)):
+            self.phase_table.setItem(row, col, QTableWidgetItem(str(value)))
+
+    def _on_remove_phase_row(self):
+        rows = sorted({i.row() for i in self.phase_table.selectedIndexes()}, reverse=True)
+        if not rows:
+            rows = [self.phase_table.rowCount() - 1]
+        for row in rows:
+            if self.phase_table.rowCount() > 1:
+                self.phase_table.removeRow(row)
+        self._invalidate_preview()
+
+    def _sync_region_bounds(self):
+        """Point the region controls at the loaded recording's frame count.
+
+        Until the handles are dragged the region tracks the whole recording, so switching
+        to region mode analyses everything rather than the two-frame sliver a freshly
+        constructed slider would otherwise report.
+        """
+        t = self.session.t_plot
+        if t is None or len(t) < 2:
+            return
+        last = len(t) - 1
+        for widget in (self.region_slider, self.region_start_spin, self.region_end_spin):
+            widget.blockSignals(True)
+        self.region_slider.setRange(0, last)
+        self.region_start_spin.setRange(0, last)
+        self.region_end_spin.setRange(0, last)
+        start, end = self.region_slider.value()
+        if not self._region_touched or end <= start or end > last:
+            start, end = 0, last
+            self.region_slider.setValue((start, end))
+        self.region_start_spin.setValue(start)
+        self.region_end_spin.setValue(end)
+        for widget in (self.region_slider, self.region_start_spin, self.region_end_spin):
+            widget.blockSignals(False)
+        self._describe_region()
+
+    def _on_region_changed(self, value):
+        start, end = value
+        self._region_touched = True
+        self.region_start_spin.blockSignals(True)
+        self.region_end_spin.blockSignals(True)
+        self.region_start_spin.setValue(start)
+        self.region_end_spin.setValue(end)
+        self.region_start_spin.blockSignals(False)
+        self.region_end_spin.blockSignals(False)
+        self._describe_region()
+        self._invalidate_preview()
+
+    def _on_region_spin_changed(self):
+        start, end = self.region_start_spin.value(), self.region_end_spin.value()
+        if end <= start:
+            return  # half-typed range; wait for the other box
+        self._region_touched = True
+        self.region_slider.blockSignals(True)
+        self.region_slider.setValue((start, end))
+        self.region_slider.blockSignals(False)
+        self._describe_region()
+        self._invalidate_preview()
+
+    def _region_frames(self):
+        """(start, end) frame indices of the region, inclusive of both ends."""
+        start, end = self.region_slider.value()
+        return int(start), int(end)
+
+    def _describe_region(self):
+        t = self.session.t_plot
+        if t is None:
+            return
+        start, end = self._region_frames()
+        end = min(end, len(t) - 1)
+        n = end - start + 1
+        rate = self.session.frame_rate or 0.0
+        bin_width = rate / n if n else float("inf")
+        self.region_info.setText(
+            f"frames <b>{start}–{end}</b> of 0–{len(t) - 1} · "
+            f"<b>{t[start]:.2f}–{t[end]:.2f} s</b> · {n} frames = {n / rate:.2f} s"
+            # [Index B disabled] the FFT resolution of the region, which only mattered
+            # for the frequency bands:
+            # f"<br>Index B resolution here: FFT bin width {bin_width:.3f} Hz — bands "
+            # f"below that are refused."
+        )
+
     def _phases(self):
+        """The phase dict for the current mode: the table, or the region as one phase."""
+        if self._region_mode():
+            t = self.session.t_plot
+            if t is None:
+                raise ValueError("Load traces and an inferred rate before selecting a region.")
+            start, end = self._region_frames()
+            end = min(end, len(t) - 1)
+            if end <= start:
+                raise ValueError("The region is empty; drag the two handles apart.")
+            # Named for the window it covers, so the export folder and every figure legend
+            # carry the region rather than a generic label.
+            return {f"region_{t[start]:.1f}-{t[end]:.1f}s": (float(t[start]),
+                                                             float(t[end]) + 1e-9)}
         phases = {}
         for row in range(self.phase_table.rowCount()):
             name = self.phase_table.item(row, 0)
@@ -1320,79 +1822,310 @@ class PipelineWindow(QMainWindow):
             raise ValueError("Define at least one phase.")
         return phases
 
-    def _bands(self):
-        bands = []
-        for row in range(self.band_table.rowCount()):
-            lo, hi = self.band_table.item(row, 0), self.band_table.item(row, 1)
-            if lo and hi and lo.text().strip() and hi.text().strip():
-                bands.append((float(lo.text()), float(hi.text())))
-        if not bands:
-            raise ValueError("Define at least one frequency band.")
-        return bands
+    # [Index B disabled] reader for the frequency-band table
+    # def _bands(self):
+    #     bands = []
+    #     for row in range(self.band_table.rowCount()):
+    #         lo, hi = self.band_table.item(row, 0), self.band_table.item(row, 1)
+    #         if lo and hi and lo.text().strip() and hi.text().strip():
+    #             bands.append((float(lo.text()), float(hi.text())))
+    #     if not bands:
+    #         raise ValueError("Define at least one frequency band.")
+    #     return bands
 
-    def _on_run_analysis(self):
+    def _analysis_cfg(self, out_dir=None):
+        """Validate the current settings and build the config both paths share.
+
+        Returns None after warning the user when anything is unusable -- the checks that
+        used to sit inline in the run handler, now also guarding the preview so an empty
+        region or a phase with no frames is caught before any work starts.
+        """
         s = self.session
         try:
-            phases, bands = self._phases(), self._bands()
+            phases = self._phases()
+            # [Index B disabled] bands = self._bands()
         except ValueError as exc:
-            return self._warn(str(exc))
+            self._warn(str(exc))
+            return None
 
+        # [Index B disabled] the Nyquist guard on the top band edge. It only constrained
+        # the frequency bands, and nothing reads them now.
         # The top edge is *meant* to sit at Nyquist, so compare with tolerance: a
         # measured 9.999999 Hz puts Nyquist at 4.9999995 and would otherwise reject the
         # documented default band of 5.0 Hz on floating-point margin alone.
-        nyquist = s.frame_rate / 2.0
-        top = max(hi for _, hi in bands)
-        if top > nyquist and not np.isclose(top, nyquist, rtol=1e-6):
-            return self._warn(f"The top band edge ({top:g} Hz) exceeds Nyquist "
-                              f"({nyquist:.3f} Hz) for a {s.frame_rate:.3f} Hz recording. "
-                              "Lower it — there is no information above Nyquist to recover.")
+        # nyquist = s.frame_rate / 2.0
+        # top = max(hi for _, hi in bands)
+        # if top > nyquist and not np.isclose(top, nyquist, rtol=1e-6):
+        #     self._warn(f"The top band edge ({top:g} Hz) exceeds Nyquist "
+        #                f"({nyquist:.3f} Hz) for a {s.frame_rate:.3f} Hz recording. "
+        #                "Lower it — there is no information above Nyquist to recover.")
+        #     return None
 
-        # Index B reads the FFT helper out of CascadeTorch/scripts, so a missing
-        # CASCADE_DIR fails halfway through -- after the Index A CSVs are already on
-        # disk. Check it before anything is written.
-        if self._dir(self.cascade_dir_edit) is None:
-            return self._warn("Set CASCADE_DIR (tab 5) before running the analysis: the "
-                              "frequency features (Index B) load their FFT helper from "
-                              "CascadeTorch/scripts.")
-
-        # Asked here, not derived from the analysis root: every artifact below
-        # (features, PCA, groups, figures) is written under this folder, and re-running
-        # with different phases or cut heights into the derived <root>/<tag> would
-        # overwrite the previous pass for the same dataset with no trace of it.
-        out_dir = self._pick_output_dir("Folder for this analysis run's outputs")
-        if out_dir is None:
-            return  # cancelled
-        self._log(f"> Analysis outputs -> {out_dir}")
+        # [Index B disabled] the CASCADE_DIR requirement. It existed only because
+        # freq_features loads its FFT helper from CascadeTorch/scripts; Index A never
+        # needed it, so demanding it now would block the analysis for no reason.
+        # if self._dir(self.cascade_dir_edit) is None:
+        #     self._warn("Set CASCADE_DIR (tab 5) before running the analysis: the "
+        #                "frequency features (Index B) load their FFT helper from "
+        #                "CascadeTorch/scripts.")
+        #     return None
 
         cut_rate = self.rate_cut_edit.text().strip()
-        cut_freq = self.freq_cut_edit.text().strip()
-        cfg = dict(
-            phases=phases, bands=bands, out_dir=out_dir,
+        # [Index B disabled] cut_freq = self.freq_cut_edit.text().strip()
+        return dict(
+            phases=phases, out_dir=out_dir,
+            # [Index B disabled] bands=bands,
+            region=self._region_frames() if self._region_mode() else None,
             cascade_dir=self._dir(self.cascade_dir_edit),
             var_target=self.var_target_spin.value(), max_k=self.max_k_spin.value(),
             min_group=self.min_group_spin.value(), max_frac=self.max_frac_spin.value(),
             n_sigma=self.n_sigma_spin.value(),
             active_thresh=None if self.auto_thresh_check.isChecked()
             else self.active_thresh_spin.value(),
+            k_rate=self.rate_k_slider.value(),
+            # [Index B disabled] k_freq=self.freq_k_slider.value(),
             cut_rate=float(cut_rate) if cut_rate else None,
-            cut_freq=float(cut_freq) if cut_freq else None,
+            # [Index B disabled] cut_freq=float(cut_freq) if cut_freq else None,
             model_name=self.model_combo.currentText(),
         )
-        spike_rate, matrix, roi_ids, t_plot, pad, rate = (
-            s.spike_rate, s.dff_matrix, s.roi_ids, s.t_plot, s.pad, s.frame_rate)
+
+    def _analysis_inputs(self, cfg):
+        """(spike_rate, dff, roi_ids, t, pad) for the configured window.
+
+        In region mode everything is cropped to the selected frames and `pad` is
+        RECOUNTED on the crop: session.pad describes CASCADE's NaN frames at the ends of
+        the full trace, and a crop may exclude them entirely or land inside them. Reusing
+        the old number would blank real frames in the group-mean panel, or expose NaN
+        ones.
+        """
+        s = self.session
+        spike_rate, dff, t, pad = s.spike_rate, s.dff_matrix, s.t_plot, s.pad
+        if cfg["region"] is None:
+            return spike_rate, dff, s.roi_ids, t, pad
+
+        start, end = cfg["region"]
+        end = min(end, len(t) - 1)
+        sl = slice(start, end + 1)
+        spike_rate, dff, t = spike_rate[:, sl], dff[:, sl], t[sl]
+        finite = np.isfinite(spike_rate[0])
+        pad = int(np.argmax(finite)) if not finite.all() else 0
+        self._log(f"> Region: frames {start}–{end} ({t[0]:.2f}–{t[-1]:.2f} s), "
+                  f"{spike_rate.shape[1]} frames; NaN pad recounted as {pad} per end.")
+        return spike_rate, dff, s.roi_ids, t, pad
+
+    def _baseline_mask(self, cfg):
+        """Baseline frames for ACTIVE_THRESH, as a mask over the FULL time axis.
+
+        Always the full axis, never the crop, so the threshold can be measured outside
+        the window being analysed. In phase mode that is the first phase, as before. In
+        region mode it is everything BEFORE the region: a threshold measured inside the
+        window under test is set by the very response it is meant to detect, so a region
+        covering the stimulus would report almost nothing as active.
+        """
+        full_t = self.session.t_plot
+        if cfg["region"] is None:
+            first = list(cfg["phases"])[0]
+            return at.features.phase_masks(full_t, cfg["phases"])[first], f"phase {first!r}"
+
+        start, end = cfg["region"]
+        if start == 0:
+            self._log("! The region starts at frame 0, so nothing precedes it: "
+                      "ACTIVE_THRESH falls back to the region itself. That is circular — "
+                      "set a manual threshold, or start the region later.")
+            mask = np.zeros(len(full_t), dtype=bool)
+            mask[start:min(end, len(full_t) - 1) + 1] = True
+            return mask, "the region itself (no earlier frames exist)"
+        mask = at.features.baseline_mask_before(full_t, float(full_t[start]))
+        return mask, f"frames 0–{start - 1} ({full_t[0]:.2f}–{full_t[start - 1]:.2f} s)"
+
+    def _resolve_active_thresh(self, cfg):
+        """The threshold and a one-line provenance string, ready for the params JSON."""
+        if cfg["active_thresh"] is not None:
+            return float(cfg["active_thresh"]), "set manually"
+        mask, where = self._baseline_mask(cfg)
+        thresh, med, sigma = at.features.auto_active_thresh(
+            self.session.spike_rate, mask, cfg["n_sigma"])
+        return thresh, (f"auto: median + {cfg['n_sigma']:g}·σ over {where} "
+                        f"(median {med:.3f}, σ {sigma:.3f})")
+
+    # --- preview --------------------------------------------------------------------
+    def _on_preview_analysis(self):
+        cfg = self._analysis_cfg()
+        if cfg is None:
+            return
+        spike_rate, dff, roi_ids, t, pad = self._analysis_inputs(cfg)
+        try:
+            thresh, provenance = self._resolve_active_thresh(cfg)
+        except ValueError as exc:
+            return self._warn(str(exc))
+        cfg["active_thresh"], cfg["thresh_provenance"] = thresh, provenance
 
         def work():
-            return _compute_analysis(spike_rate, matrix, roi_ids, t_plot, pad, rate, cfg)
+            return _compute_features(spike_rate, dff, roi_ids, t, pad, self.session.frame_rate,
+                                     cfg)
+
+        def done(bundle):
+            self._preview = bundle
+            self._sync_k_ranges()
+            self._redraw_preview()
+            self.analysis_tabs.setCurrentIndex(1)
+            self._refresh_gating()
+
+        self._run(work, done, "Computing features, PCA and tree…")
+
+    def _invalidate_preview(self, *_):
+        """Drop a preview whose configuration no longer matches the controls.
+
+        Anything that changes the feature table invalidates it. The alternative -- leaving
+        the old figures up -- means the panel shows a grouping of a window the user is no
+        longer looking at, which is exactly the mistake the preview exists to prevent.
+        """
+        if getattr(self, "_preview", None) is None:
+            return
+        self._preview = None
+        for canvas in (self.preview_dendrogram, self.preview_scatter, self.preview_traces):
+            canvas.clear()
+        self.preview_explainer.setText("")
+        self.preview_status.setText(
+            "Settings changed — press ‘Preview’ in the Setup tab to recompute.")
+        self._refresh_gating()
+
+    def _sync_k_ranges(self):
+        """Cap both k sliders at what the trees can actually deliver (n_rois groups)."""
+        bundle = getattr(self, "_preview", None)
+        if bundle is None:
+            return
+        n_rois = len(bundle["roi_ids"])
+        # [Index B disabled] the freq entry, ("freq", self.freq_k_slider), is dropped here
+        for which, slider in (("rate", self.rate_k_slider),):
+            top = max(2, min(self.max_k_spin.value(), n_rois))
+            slider.blockSignals(True)
+            slider.setRange(2, top)
+            slider.setValue(min(slider.value(), top))
+            slider.blockSignals(False)
+            self._update_k_label(which)
+
+    def _on_max_k_changed(self):
+        self._sync_k_ranges()
+        self._invalidate_preview()  # MAX_K also drives cut_candidates in the export
+
+    def _on_k_changed(self, which):
+        self._update_k_label(which)
+        if getattr(self, "_preview", None) is None:
+            return
+        # Debounced: dragging the slider fires valueChanged per pixel, and each redraw
+        # costs ~100-200 ms. Coalescing to one redraw per idle moment keeps the drag
+        # smooth instead of queueing a backlog of stale frames.
+        self._preview_timer.start(120)
+
+    def _update_k_label(self, which):
+        # [Index B disabled] both lookups collapse to the rate widgets; restore the
+        # `if which == "rate" else self.freq_k_slider / self.freq_k_label` forms with it.
+        slider, label = self.rate_k_slider, self.rate_k_label
+        bundle = getattr(self, "_preview", None)
+        text = f"k={slider.value()}"
+        if bundle is not None:
+            try:
+                height = at.grouping.height_for_k(bundle[which]["Z"], slider.value())
+                text += f"  (h={height:.2f})"
+            except ValueError:
+                text += "  (beyond the tree)"
+        label.setText(text)
+
+    def _redraw_preview(self):
+        """Re-cut the stored tree at the current k and redraw. No recomputation."""
+        bundle = getattr(self, "_preview", None)
+        if bundle is None:
+            return
+        # [Index B disabled] the combo carries a single hidden entry, so fall back to
+        # "rate" rather than KeyError-ing on an empty or cleared selection.
+        which = self.preview_index_combo.currentData() or "rate"
+        part = bundle[which]
+        # [Index B disabled] `which` can only be "rate", so the freq branches collapse:
+        # k = (self.rate_k_slider if which == "rate" else self.freq_k_slider).value()
+        # prefix = "G" if which == "rate" else "F"
+        k = self.rate_k_slider.value()
+        prefix = "G"
+
+        groups = at.grouping.cut_tree_k(part["Z"], k, bundle["roi_ids"],
+                                        self.max_frac_spin.value(), verbose=False)
+        height = at.grouping.height_for_k(part["Z"], k)
+        label = "Index A (inferred rate)" if which == "rate" else "Index B (frequency)"
+
+        self.preview_dendrogram.show_figure(
+            at.plots.dendrogram_plot(part["Z"], bundle["roi_ids"], label, height))
+        self.preview_scatter.show_figure(
+            at.plots.pca_scatter(part["pca"], part["scores"], bundle["roi_ids"], groups,
+                                 f"{label} — ROIs in PC space, coloured by group"))
+        self.preview_traces.show_figure(
+            at.plots.group_means(bundle["spike_rate"], bundle["t"], groups,
+                                 bundle["roi_ids"], bundle["stim"], bundle["pad"],
+                                 f"{label} — inferred rate per {prefix}-group at k={k}"))
+        self._update_k_label(which)
+
+        sizes = np.bincount(groups)[1:]
+        self.preview_status.setText(
+            f"<b>{int(groups.max())}</b> group(s) at k={k} (h={height:.2f}) · sizes "
+            f"{', '.join(str(int(n)) for n in sizes)} · {len(bundle['roi_ids'])} ROIs · "
+            f"window: {bundle['window_label']}")
+        self.preview_explainer.setText(_pca_explainer(part, bundle, which))
+
+    def _on_run_analysis(self):
+        cfg = self._analysis_cfg()
+        if cfg is None:
+            return
+        spike_rate, dff, roi_ids, t, pad = self._analysis_inputs(cfg)
+        try:
+            thresh, provenance = self._resolve_active_thresh(cfg)
+        except ValueError as exc:
+            return self._warn(str(exc))
+        cfg["active_thresh"], cfg["thresh_provenance"] = thresh, provenance
+
+        # A parent folder, asked once per session; each run gets its own auto-named
+        # subfolder under it. Deriving the whole path from <root>/<tag> instead would give
+        # every run of a dataset the same destination, so a second region or a second k
+        # would overwrite the first with no trace of it.
+        parent = self._analysis_parent()
+        if parent is None:
+            return  # cancelled
+        out_dir = parent / _run_folder_name(cfg)
+        if out_dir.exists() and any(out_dir.iterdir()):
+            answer = QMessageBox.question(
+                self, "Overwrite?",
+                f"{out_dir.name} already holds output from an identical configuration.\n\n"
+                "Overwrite it?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cfg["out_dir"] = out_dir
+        self._log(f"> Analysis outputs -> {out_dir}")
+
+        rate = self.session.frame_rate
+
+        def work():
+            return _compute_analysis(spike_rate, dff, roi_ids, t, pad, rate, cfg)
 
         self._run(work, self._finish_analysis, "Running features, PCA and clustering…")
+
+    def _analysis_parent(self):
+        """The parent folder for auto-named run subfolders, asked once and remembered."""
+        if self._analysis_parent_dir is not None and self._analysis_parent_dir.exists():
+            return self._analysis_parent_dir
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Parent folder for analysis runs (subfolders are named automatically)",
+            self._suggested_output_dir())
+        if not chosen:
+            return None
+        self._analysis_parent_dir = Path(chosen)
+        return self._analysis_parent_dir
 
     def _finish_analysis(self, bundle):
         """Draw and export the figures here, on the UI thread.
 
-        pyplot is not thread-safe: building figures inside the worker deadlocks against
-        the Qt event loop (0% CPU, never returns). The heavy part -- features, PCA,
-        linkage, the CSV/npz writes -- already ran off-thread; only plotting is left, and
-        it takes a couple of seconds.
+        The figures themselves are pyplot-free now (`analysis_tools.plots` builds
+        `Figure` objects directly), so this no longer has to be here for thread safety --
+        it stays because drawing is the slow part and the status line should update
+        between the numbers and the export.
         """
         self.status.setText("Exporting figures…")
         QApplication.processEvents()
@@ -1429,19 +2162,32 @@ class PipelineWindow(QMainWindow):
         path = self._zarr_path()
         preprocessed_dir = self._dir(self.preprocessed_dir_edit)
         if path is None:
-            self.zarr_info.setText("— set PREPROCESSED_DIR and load a dataset")
+            # Name what is actually missing. The old wording named one cause ("load a
+            # dataset") out of three, and named a field that has since been renamed, so
+            # it misdirected whenever the blocker was an unticked denoise method.
+            missing = []
+            if not self.session.dataset_tag:
+                missing.append("load a dataset or a .zarr store")
+            if not self._denoise_method():
+                missing.append("tick at least one denoise method")
+            if preprocessed_dir is None:
+                missing.append("set the preprocessed data directory")
+            self.zarr_info.setText("— " + "; ".join(missing))
         else:
             exists = "on disk" if path.exists() else "not yet saved"
+            # Also keyed on dataset_tag rather than data_dir, so a session started from a
+            # .zarr still lists the other chains cached beside it.
             cached = sorted(p.stem.split("_", 1)[-1]
                             for p in preprocessed_dir.glob(
-                                f"{self.session.dataset_tag}_*.zarr")) if self.session.data_dir else []
+                                f"{self.session.dataset_tag}_*.zarr"))
             self.zarr_info.setText(f"<code>{path}</code><br><i>{exists}</i>"
                                    + (f" · cached chains: {', '.join(cached)}" if cached else ""))
-        if self.session.frame_rate:
-            nyquist = self.session.frame_rate / 2.0
-            self.band_caption.setText(
-                f"Upper edge is capped by Nyquist = {nyquist:.2f} Hz at "
-                f"{self.session.frame_rate:.2f} Hz acquisition.")
+        # [Index B disabled] Nyquist note under the band table
+        # if self.session.frame_rate:
+        #     nyquist = self.session.frame_rate / 2.0
+        #     self.band_caption.setText(
+        #         f"Upper edge is capped by Nyquist = {nyquist:.2f} Hz at "
+        #         f"{self.session.frame_rate:.2f} Hz acquisition.")
 
     def _refresh_gating(self):
         s = self.session
@@ -1498,6 +2244,7 @@ class PipelineWindow(QMainWindow):
         # Needs traces for the same reason the tab used to: a rate loaded with no dF/F
         # behind it unlocks tab 6, whose analysis reads dff_matrix and would crash on it.
         self.load_spike_btn.setEnabled(idle and has_traces)
+        self.preview_btn.setEnabled(idle and has_rate)
         self.run_analysis_btn.setEnabled(idle and has_rate)
         self._sync_derived_paths()
 
@@ -1592,39 +2339,163 @@ def _save_spike_rate_csv(out_dir, spike_rate, roi_ids, t):
 # =============================================================================
 # The analysis stage
 #
-# Split in two on purpose. Everything numeric runs in the worker; the figures are
-# built afterwards on the UI thread, because pyplot is not thread-safe -- creating
-# figures inside the worker while the Qt event loop runs deadlocks at 0% CPU and
-# never returns.
+# Three layers, because the live preview and the export need different amounts of it:
+#   _compute_features  features -> PCA -> linkage. No cut, no files. This is what the
+#                      preview holds on to, so changing k costs a cut and a redraw.
+#   _compute_analysis  the above plus the cut, the summaries and every CSV/npz write.
+#   _export_figures    drawing, run on the UI thread after the numbers are in.
 # =============================================================================
+
+def _run_folder_name(cfg):
+    """Auto-name for one run's output subfolder: window + cut, so runs never collide."""
+    if cfg.get("region") is not None:
+        window = next(iter(cfg["phases"]))          # already 'region_<t0>-<t1>s'
+    else:
+        window = f"phases_{'-'.join(cfg['phases'])}"
+    cut = (f"h{cfg['cut_rate']:g}" if cfg.get("cut_rate") is not None
+           else f"k{cfg.get('k_rate') or 4}")
+    return f"{window}_{cut}".replace(" ", "").replace("/", "_")
+
+
+def _pca_explainer(part, bundle, which):
+    """What the PCA is actually measuring, in the panel where the groups are judged.
+
+    Written out because the grouping is easy to over-read: the distances are between
+    per-phase summary statistics, not between traces, and which features dominate is a
+    consequence of choices made elsewhere in this tab (ACTIVE_THRESH above all).
+    """
+    pca, features = part["pca"], part["features"]
+    var = pca.explained_variance_ratio_ * 100
+    n_pc = part["n_pc"]
+    names = list(features.columns)
+
+    def top(component, n=3):
+        order = np.argsort(np.abs(component))[::-1][:n]
+        return ", ".join(f"{names[i]} ({component[i]:+.2f})" for i in order)
+
+    # [Index B disabled] `which` is always "rate" now; the else-branch below is kept so
+    # the wording comes back with the index rather than having to be rewritten.
+    if which == "rate":
+        what = ("three numbers per ROI per phase — mean rate, peak rate and active "
+                "fraction (the share of frames above ACTIVE_THRESH)")
+        levers = (
+            "Because z-scoring gives every feature equal weight, a feature that barely "
+            "varies across ROIs contributes almost nothing to the distance. ACTIVE_THRESH "
+            "enters only through active fraction: raise it and quiet ROIs collapse "
+            "together, lower it and the feature saturates at 1 and separates nothing. "
+            "Peak rate is a single-frame statistic, so a bursty ROI sits far from a steady "
+            "one at identical mean rate.")
+    else:
+        what = ("relative band powers plus the dominant frequency, per ROI per phase — "
+                "how the inferred rate fluctuates, not how strongly it fires")
+        levers = (
+            "Band powers are relative (shares of in-band power), so an ROI's overall rate "
+            "cancels out and only the SHAPE of its spectrum matters — a quiet ROI and a "
+            "loud one with the same rhythm land together. Silent ROI×phase cells score 0 "
+            "across every band, which clusters them as a group of their own.")
+
+    return (
+        f"<b>What this PCA measures.</b> It runs on the z-scored feature table, not on the "
+        f"traces: for {'Index A' if which == 'rate' else 'Index B'} that is {what}. "
+        f"Distances between ROIs are Euclidean in the leading {n_pc} PC(s) — those covering "
+        f"PCA_VAR_TARGET of the variance — and Ward linkage merges whichever pair adds "
+        f"least within-cluster variance.<br>"
+        f"<b>How spiking features shape it.</b> {levers}<br>"
+        f"<b>This fit:</b> {n_pc} PC(s) cover {np.cumsum(var)[n_pc - 1]:.0f}% of variance "
+        f"across {len(names)} features · PC1 ({var[0]:.0f}%) loads most on {top(pca.components_[0])} "
+        f"· PC2 ({var[1]:.0f}%) on {top(pca.components_[1])} · ACTIVE_THRESH = "
+        f"{bundle['active_thresh']:.3f} spikes/s, {bundle['thresh_provenance']}.<br>"
+        f"Groups are a partition of this feature space, not cell types.")
+
+
+def _compute_features(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, cfg):
+    """Everything up to (but not including) the cut, for both indices.
+
+    Deliberately stops before `cut_tree`: the cut is the one thing the live preview
+    changes, and keeping it out of here is what makes dragging k free.
+    """
+    phases = cfg["phases"]
+    masks = at.features.phase_masks(t_plot, phases)
+    at.features.describe_phases(t_plot, phases, masks, frame_rate)
+
+    # The GUI resolves the threshold before calling, because only it can reach the
+    # UNCROPPED recording that a region's baseline has to come from. Falling back to the
+    # first phase here keeps this function usable on its own, which is how it behaved
+    # before the region mode existed.
+    active_thresh = cfg.get("active_thresh")
+    provenance = cfg.get("thresh_provenance")
+    if active_thresh is None:
+        first = list(phases)[0]
+        active_thresh, med, sigma = at.features.auto_active_thresh(
+            spike_rate, masks[first], cfg["n_sigma"])
+        provenance = (f"auto: median + {cfg['n_sigma']:g}·σ over phase {first!r} of this "
+                      f"window (median {med:.3f}, σ {sigma:.3f})")
+    print(f"> ACTIVE_THRESH = {active_thresh:.3f} spikes/s ({provenance})")
+
+    rate_feats = at.features.rate_features(spike_rate, roi_ids, masks, active_thresh)
+    dff_summary = at.features.dff_summary(dff_matrix, roi_ids, masks)
+    at.features.report_threshold(rate_feats, masks, active_thresh)
+
+    # [Index B disabled] band description + frequency features
+    # at.features.describe_bands(masks, frame_rate, cfg["bands"])
+    # freq_feats = at.features.freq_features(spike_rate, roi_ids, masks, frame_rate,
+    #                                        cfg["bands"], cfg["cascade_dir"])
+
+    out = {"cfg": cfg, "roi_ids": roi_ids, "spike_rate": spike_rate, "dff": dff_matrix,
+           "t": t_plot, "pad": pad, "frame_rate": frame_rate, "masks": masks,
+           "phase_order": list(phases), "dff_summary": dff_summary,
+           "active_thresh": active_thresh, "thresh_provenance": provenance,
+           "stim": _stim_window(phases),
+           "window_label": (next(iter(phases)) if cfg.get("region") is not None
+                            else f"{len(phases)} phases over {t_plot[0]:.1f}–{t_plot[-1]:.1f} s")}
+    # [Index B disabled] the freq entry, ("freq", freq_feats), is dropped from this loop
+    for label, feats in (("rate", rate_feats),):
+        pca, scores, n_pc, Z = at.grouping.pca_and_linkage(feats, cfg["var_target"])
+        out[label] = {"features": feats, "pca": pca, "scores": scores, "n_pc": n_pc, "Z": Z}
+    return out
+
+
+def _stim_window(phases):
+    """The band shaded in the trace panels: the phase named 'stim', else the second one."""
+    if "stim" in phases:
+        return phases["stim"]
+    values = list(phases.values())
+    return values[1] if len(values) > 1 else values[0]
+
+
+def _resolve_cut(part, cfg, roi_ids, which, label, prefix):
+    """Groups + the height that produced them, honouring an explicit height over k."""
+    Z = part["Z"]
+    override = cfg.get(f"cut_{which}")
+    if override is not None:
+        return at.grouping.cut_tree(Z, override, roi_ids, cfg["max_frac"], label=label,
+                                    prefix=prefix), float(override)
+    k = int(cfg.get(f"k_{which}") or 4)
+    groups = at.grouping.cut_tree_k(Z, k, roi_ids, cfg["max_frac"], label=label,
+                                    prefix=prefix)
+    return groups, at.grouping.height_for_k(Z, k)
+
 
 def _compute_analysis(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, cfg):
     """Features -> PCA -> Ward cut -> summaries -> CSV/npz, for both indices.
 
     No plotting: returns everything `_export_figures` needs to draw afterwards.
     """
-    out_dir, phases, bands = cfg["out_dir"], cfg["phases"], cfg["bands"]
-    phase_order = list(phases)
-    masks = at.features.phase_masks(t_plot, phases)
-    at.features.describe_phases(t_plot, phases, masks, frame_rate)
-
-    active_thresh = cfg["active_thresh"]
-    if active_thresh is None:
-        active_thresh, _, _ = at.features.auto_active_thresh(
-            spike_rate, masks[phase_order[0]], cfg["n_sigma"])
-
-    rate_features = at.features.rate_features(spike_rate, roi_ids, masks, active_thresh)
-    dff_summary = at.features.dff_summary(dff_matrix, roi_ids, masks)
-    at.features.report_threshold(rate_features, masks, active_thresh)
+    out_dir, phases = cfg["out_dir"], cfg["phases"]
+    # [Index B disabled] bands = cfg["bands"]
+    bundle = _compute_features(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, cfg)
+    phase_order, masks = bundle["phase_order"], bundle["masks"]
+    active_thresh, dff_summary = bundle["active_thresh"], bundle["dff_summary"]
+    rate_features = bundle["rate"]["features"]
+    # [Index B disabled] freq_features = bundle["freq"]["features"]
 
     # --- Index A (Inferred Spike Rate) -------------------------------------------------------------
-    pca_rate, scores_rate, npc_rate, z_rate = at.grouping.pca_and_linkage(
-        rate_features, cfg["var_target"])
+    part_rate = bundle["rate"]
+    pca_rate, scores_rate, npc_rate, z_rate = (part_rate["pca"], part_rate["scores"],
+                                               part_rate["n_pc"], part_rate["Z"])
     print(at.grouping.cut_candidates(z_rate, cfg["max_k"]).to_string())
-    cut_rate = cfg["cut_rate"] if cfg["cut_rate"] is not None else at.grouping.suggest_cut(
-        z_rate, cfg["max_k"], cfg["min_group"], cfg["max_frac"])
-    rate_groups = at.grouping.cut_tree(z_rate, cut_rate, roi_ids, cfg["max_frac"],
-                                       label="inferred-rate")
+    rate_groups, cut_rate = _resolve_cut(part_rate, cfg, roi_ids, "rate",
+                                         "inferred-rate", "G")
     print(at.features.group_summary(rate_features, dff_summary, rate_groups,
                                     phase_order).to_string())
     print("\n(dff_peak_* is descriptive only -- dF/F amplitude is not a rate proxy, "
@@ -1637,48 +2508,102 @@ def _compute_analysis(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, 
                       groups=rate_groups, roi_ids=roi_ids)
 
     # --- Index B (Frequency Domain) -------------------------------------------------------------
-    at.features.describe_bands(masks, frame_rate, bands)
-    freq_features = at.features.freq_features(spike_rate, roi_ids, masks, frame_rate, bands,
-                                              cfg["cascade_dir"])
-    pca_freq, scores_freq, npc_freq, z_freq = at.grouping.pca_and_linkage(
-        freq_features, cfg["var_target"])
-    print(at.grouping.cut_candidates(z_freq, cfg["max_k"]).to_string())
-    cut_freq = cfg["cut_freq"] if cfg["cut_freq"] is not None else at.grouping.suggest_cut(
-        z_freq, cfg["max_k"], cfg["min_group"], cfg["max_frac"])
-    freq_groups = at.grouping.cut_tree(z_freq, cut_freq, roi_ids, cfg["max_frac"],
-                                       label="frequency", prefix="F")
-    print(at.features.freq_group_summary(freq_features, freq_groups, phase_order,
-                                         bands).to_string())
-    at.grouping.print_membership(freq_groups, roi_ids, prefix="F")
-    _table, ari = at.grouping.compare_partitions(rate_groups, freq_groups)
-    at.store.save_features(out_dir, "freq_features", freq_features)
-    at.store.save_pca(out_dir, "freq", pca_freq, scores_freq, npc_freq, z_freq,
-                      list(freq_features.columns), cut_height=cut_freq,
-                      groups=freq_groups, roi_ids=roi_ids)
-    at.store.save_groups(out_dir, pd.DataFrame({"roi": roi_ids, "rate_group": rate_groups,
-                                                "freq_group": freq_groups}))
+    # [Index B disabled] the whole second index: its cut, summary, membership, the
+    # rate-vs-frequency agreement (ARI) and both of its exported artifacts.
+    # part_freq = bundle["freq"]
+    # pca_freq, scores_freq, npc_freq, z_freq = (part_freq["pca"], part_freq["scores"],
+    #                                            part_freq["n_pc"], part_freq["Z"])
+    # print(at.grouping.cut_candidates(z_freq, cfg["max_k"]).to_string())
+    # freq_groups, cut_freq = _resolve_cut(part_freq, cfg, roi_ids, "freq", "frequency", "F")
+    # print(at.features.freq_group_summary(freq_features, freq_groups, phase_order,
+    #                                      bands).to_string())
+    # at.grouping.print_membership(freq_groups, roi_ids, prefix="F")
+    # _table, ari = at.grouping.compare_partitions(rate_groups, freq_groups)
+    # at.store.save_features(out_dir, "freq_features", freq_features)
+    # at.store.save_pca(out_dir, "freq", pca_freq, scores_freq, npc_freq, z_freq,
+    #                   list(freq_features.columns), cut_height=cut_freq,
+    #                   groups=freq_groups, roi_ids=roi_ids)
+    # at.store.save_groups(out_dir, pd.DataFrame({"roi": roi_ids, "rate_group": rate_groups,
+    #                                             "freq_group": freq_groups}))
+    at.store.save_groups(out_dir, pd.DataFrame({"roi": roi_ids, "rate_group": rate_groups}))
+    _save_analysis_params(out_dir, cfg, bundle, rate_groups, cut_rate)
 
-    summary = (f"Index A: {int(rate_groups.max())} group(s) at h={cut_rate:.2f} · "
-               f"Index B: {int(freq_groups.max())} group(s) at h={cut_freq:.2f} · "
-               f"ARI={ari:.3f}<br>ACTIVE_THRESH={active_thresh:.3f} spikes/s<br>"
+    summary = (f"Index A: {int(rate_groups.max())} group(s) at h={cut_rate:.2f}<br>"
+               # [Index B disabled] the Index B group count and the ARI line
+               # f"Index B: {int(freq_groups.max())} group(s) at h={cut_freq:.2f} · "
+               # f"ARI={ari:.3f}<br>"
+               f"ACTIVE_THRESH={active_thresh:.3f} spikes/s "
+               f"({bundle['thresh_provenance']})<br>"
+               f"Window: {bundle['window_label']}<br>"
                f"Exported to <code>{out_dir}</code> (CSV + figures/*.tiff)")
 
     return {
         "cfg": cfg, "summary": summary, "spike_rate": spike_rate, "t_plot": t_plot,
         "roi_ids": roi_ids, "pad": pad, "active_thresh": active_thresh,
-        "stim": phases.get("stim", tuple(list(phases.values())[0])),
-        "rate_features": rate_features, "freq_features": freq_features,
+        "stim": bundle["stim"],
+        "rate_features": rate_features,
         "pca_rate": pca_rate, "scores_rate": scores_rate, "z_rate": z_rate,
         "cut_rate": cut_rate, "rate_groups": rate_groups,
-        "pca_freq": pca_freq, "scores_freq": scores_freq, "z_freq": z_freq,
-        "cut_freq": cut_freq, "freq_groups": freq_groups,
+        # [Index B disabled]
+        # "freq_features": freq_features,
+        # "pca_freq": pca_freq, "scores_freq": scores_freq, "z_freq": z_freq,
+        # "cut_freq": cut_freq, "freq_groups": freq_groups,
     }
 
 
-def _export_figures(bundle, cfg):
-    """Draw and save the six figures. UI thread only -- see the note above."""
-    import matplotlib.pyplot as plt
+def _save_analysis_params(out_dir, cfg, bundle, rate_groups, cut_rate):
+    # [Index B disabled] the signature dropped `freq_groups`, `cut_freq` and `ari`:
+    # def _save_analysis_params(out_dir, cfg, bundle, rate_groups, freq_groups,
+    #                           cut_rate, cut_freq, ari):
+    """Everything needed to reproduce this run, next to its outputs (CLAUDE.md 4).
 
+    The window, the threshold AND WHERE IT CAME FROM, and both cuts -- an exported
+    grouping whose threshold provenance is unknown cannot be compared with another run,
+    only looked at.
+    """
+    region = cfg.get("region")
+    t = bundle["t"]
+    params = {
+        "window_mode": "region" if region is not None else "phases",
+        "region_frames": list(region) if region is not None else None,
+        "window_seconds": [float(t[0]), float(t[-1])],
+        "n_frames": int(len(t)),
+        "phases": {k: list(v) for k, v in cfg["phases"].items()},
+        # [Index B disabled] "bands_hz": [list(b) for b in cfg["bands"]],
+        "index_b_frequency_pca": "disabled in this build",
+        "frame_rate_hz": bundle["frame_rate"],
+        "pad_frames_per_end": int(bundle["pad"]),
+        "n_rois": len(bundle["roi_ids"]),
+        "active_thresh": float(bundle["active_thresh"]),
+        "active_thresh_provenance": bundle["thresh_provenance"],
+        "active_n_sigma": cfg["n_sigma"],
+        "pca_var_target": cfg["var_target"],
+        "pca_n_components_rate": int(bundle["rate"]["n_pc"]),
+        # [Index B disabled] "pca_n_components_freq": int(bundle["freq"]["n_pc"]),
+        "max_k": cfg["max_k"], "min_group_size": cfg["min_group"],
+        "max_group_frac": cfg["max_frac"],
+        "cut_rate": {"requested_k": cfg.get("k_rate"), "height_override": cfg.get("cut_rate"),
+                     "height_used": float(cut_rate), "n_groups": int(rate_groups.max())},
+        # [Index B disabled]
+        # "cut_freq": {"requested_k": cfg.get("k_freq"), "height_override": cfg.get("cut_freq"),
+        #              "height_used": float(cut_freq), "n_groups": int(freq_groups.max())},
+        # "adjusted_rand_index": float(ari),
+        "spike_inference_model": cfg["model_name"],
+        "clustering": "z-score -> PCA -> Ward linkage -> fcluster",
+    }
+    path = Path(out_dir) / "analysis_params.json"
+    path.write_text(json.dumps(params, indent=2))
+    print(f"> Saved analysis_params.json -> {path}")
+    return path
+
+
+def _export_figures(bundle, cfg):
+    """Draw and save the six figures, on the UI thread.
+
+    `analysis_tools.plots` builds bare `Figure` objects, so nothing here touches pyplot
+    and there is no global figure registry to close against -- the figures are released
+    when this function returns.
+    """
     out_dir = cfg["out_dir"]
     b = bundle
     label = (f"CASCADE | {cfg['model_name']} | "
@@ -1687,11 +2612,11 @@ def _export_figures(bundle, cfg):
 
     def save(fig, name):
         paths.append(at.store.save_figure(fig, out_dir, name))
-        plt.close(fig)  # the analysis can be re-run many times in one session
 
     save(at.plots.pca_summary(b["pca_rate"], b["scores_rate"], b["rate_features"],
                               b["roi_ids"], "PCA-A: per-phase inferred-rate features",
-                              cfg["var_target"]), "pca_rate_summary")
+                              cfg["var_target"], groups=b["rate_groups"]),
+         "pca_rate_summary")
     save(at.plots.dendrogram_plot(b["z_rate"], b["roi_ids"], "Index A (inferred rate)",
                                   b["cut_rate"]), "dendrogram_rate")
     save(at.plots.rate_heatmap(b["spike_rate"], b["t_plot"], b["roi_ids"], b["rate_groups"],
@@ -1701,11 +2626,13 @@ def _export_figures(bundle, cfg):
                               b["stim"], b["pad"],
                               f"Group-mean inferred rate ± SEM\n{label}"),
          "rate_group_means")
-    save(at.plots.pca_summary(b["pca_freq"], b["scores_freq"], b["freq_features"],
-                              b["roi_ids"], "PCA-B: per-phase frequency features",
-                              cfg["var_target"]), "pca_freq_summary")
-    save(at.plots.dendrogram_plot(b["z_freq"], b["roi_ids"], "Index B (frequency)",
-                                  b["cut_freq"]), "dendrogram_freq")
+    # [Index B disabled] its two figures; the export drops from six to four
+    # save(at.plots.pca_summary(b["pca_freq"], b["scores_freq"], b["freq_features"],
+    #                           b["roi_ids"], "PCA-B: per-phase frequency features",
+    #                           cfg["var_target"], groups=b["freq_groups"]),
+    #      "pca_freq_summary")
+    # save(at.plots.dendrogram_plot(b["z_freq"], b["roi_ids"], "Index B (frequency)",
+    #                               b["cut_freq"]), "dendrogram_freq")
     return paths
 
 

@@ -47,4 +47,8 @@ dependencies:
     # with napari so the whole Qt stack resolves through one package manager.
     - napari[pyqt6]
     - qtpy
+    # superqt supplies the two-handle range slider the tab-6 region selector uses
+    # (QLabeledRangeSlider). It arrives with napari anyway, but the GUI imports it
+    # directly, so it is declared rather than relied on as a transitive dependency.
+    - superqt
     # NOTE: cascade2p is vendored in ./CascadeTorch, not installed from PyPI.

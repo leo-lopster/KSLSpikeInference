@@ -36,6 +36,18 @@ def describe_phases(t, phases, masks, frame_rate):
               f"report that window as ending at {t[-1]:.1f} s.")
 
 
+def baseline_mask_before(t, until_s, from_s=0.0):
+    """Frames in [from_s, until_s) -- the threshold baseline for a cropped region.
+
+    Needed because a region analysis has only one phase, itself. Measuring the activity
+    threshold inside the window being analysed is circular: if the region IS the stimulus,
+    the threshold is set by the very response it is supposed to detect and nothing reads
+    as active. Returns an all-False mask when nothing precedes the region; the caller is
+    expected to notice and say so rather than silently thresholding on the region.
+    """
+    return (t >= from_s) & (t < until_s)
+
+
 def auto_active_thresh(spike_rate, baseline_mask, n_sigma=3.0):
     """Robust activity threshold from the baseline phase: median + n_sigma * MAD-sigma.
 
@@ -44,6 +56,9 @@ def auto_active_thresh(spike_rate, baseline_mask, n_sigma=3.0):
     either above every peak or below every trough for one of them. There is no field
     consensus on principled thresholding (CLAUDE.md 6); this is a stated convention.
     """
+    if not np.any(baseline_mask):
+        raise ValueError("The threshold baseline window contains no frames; widen it or "
+                         "set ACTIVE_THRESH manually.")
     base = spike_rate[:, baseline_mask]
     med = np.nanmedian(base)
     mad = np.nanmedian(np.abs(base - med))
@@ -144,13 +159,41 @@ def _load_fft_amplitude(cascade_dir):
     return fft_amplitude
 
 
-def describe_bands(masks, frame_rate, bands):
+def describe_bands(masks, frame_rate, bands, strict=True):
+    """Report each phase's FFT resolution and refuse bands the window cannot resolve.
+
+    A band narrower than the FFT bin width is not a measurement -- it is one or two bins,
+    and its "relative power" is an artefact of where the bin edges happen to fall. Short
+    regions hit this immediately: 5 s at 10 Hz gives a 0.2 Hz bin, exactly the default
+    lowest band edge. Raises rather than warns when `strict`, because the alternative is
+    exporting a band-power column that looks like data.
+    """
+    f_low = min(lo for lo, _ in bands)
+    worst = None
     for name, mask in masks.items():
         n = int(mask.sum())
+        bin_width = frame_rate / n
         print(f"> {name:<5} {n:>3} frames = {n / frame_rate:.1f} s -> FFT bin width "
-              f"{frame_rate / n:.3f} Hz")
+              f"{bin_width:.3f} Hz")
+        if worst is None or bin_width > worst[1]:
+            worst = (name, bin_width, n)
     print(f"> Bands {bands} Hz. The lower edge is set by the SHORTEST phase (its bin "
           f"width), the upper by the {frame_rate / 2:.1f} Hz Nyquist limit.")
+
+    name, bin_width, n = worst
+    # Compared with tolerance, like the Nyquist check in the GUI: a phase meant to be
+    # exactly 1/f_low long measures 10.000000000000014 Hz / 50 frames = 0.2000000000000003,
+    # and a bare `<` would reject the documented 0.2 Hz band on floating-point margin.
+    if f_low < bin_width and not np.isclose(f_low, bin_width, rtol=1e-6):
+        message = (
+            f"The lowest band edge ({f_low:g} Hz) is below the FFT bin width of phase "
+            f"{name!r} ({bin_width:.3f} Hz = {frame_rate:.2f} Hz / {n} frames). That band "
+            f"spans less than one bin, so its power is not measurable here. Either widen "
+            f"the window to at least {frame_rate / f_low:.0f} frames "
+            f"({1 / f_low:.1f} s) or raise the lowest band edge to {bin_width:.2f} Hz.")
+        if strict:
+            raise ValueError(message)
+        print(f"! {message}")
 
 
 def freq_features(spike_rate, roi_ids, masks, frame_rate, bands, cascade_dir):
