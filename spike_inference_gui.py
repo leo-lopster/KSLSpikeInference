@@ -2587,7 +2587,7 @@ def _compute_features(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, 
            "t": t_plot, "pad": pad, "frame_rate": frame_rate, "masks": masks,
            "phase_order": list(phases), "dff_summary": dff_summary,
            "active_thresh": active_thresh, "thresh_provenance": provenance,
-           "stim": _stim_window(phases),
+           "stim": _stim_window(phases, cfg.get("region")),
            "window_label": (next(iter(phases)) if cfg.get("region") is not None
                             else f"{len(phases)} phases over {t_plot[0]:.1f}–{t_plot[-1]:.1f} s")}
     # [Index B disabled] the freq entry, ("freq", freq_feats), is dropped from this loop
@@ -2597,12 +2597,19 @@ def _compute_features(spike_rate, dff_matrix, roi_ids, t_plot, pad, frame_rate, 
     return out
 
 
-def _stim_window(phases):
-    """The band shaded in the trace panels: the phase named 'stim', else the second one."""
+def _stim_window(phases, region=None):
+    """The band shaded in the trace panels: the phase named 'stim', else the second one.
+
+    None when there is no such band to mark. A region analysis is a single window, and a
+    lone phase covers the whole axis -- shading it greys out every subplot and says only
+    "this is the axis". The plot functions read None as "draw no band".
+    """
+    if region is not None:
+        return None
     if "stim" in phases:
         return phases["stim"]
     values = list(phases.values())
-    return values[1] if len(values) > 1 else values[0]
+    return values[1] if len(values) > 1 else None
 
 
 def _resolve_cut(part, cfg, roi_ids, which, label, prefix):

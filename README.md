@@ -1,19 +1,26 @@
 # GUI for KSLSpikeInference
 
-**The upstream CascadeTorch README is attached at the end of this file** ([PTRRupprecht/CascadeTorch](https://github.com/PTRRupprecht/CascadeTorch), GPL-3.0), since `CascadeTorch/` is vendored into this repository. Everything below documents the local pipeline that *uses* it — the DRG/DCN spike-inference workflow in this
+**The upstream CascadeTorch README is attached at the end of this file** ([PTRRupprecht/CascadeTorch](https://github.com/PTRRupprecht/CascadeTorch), GPL-3.0), since `CascadeTorch/` is vendored into this repository.
+
+Everything below documents the local pipeline that *uses* it — the DRG/DCN spike-inference workflow in this
 repository. It is not part of the upstream toolbox and will not be found in the
 CascadeTorch or Cascade repositories.
+
+Run it with `python spike_inference_gui.py`. A napari viewer opens alongside the control
+window for the image and ROI work. Every file operation goes through `analysis_tools/`,
+which the archived notebook (`archive/process_using_napari.ipynb`) also calls, so the two
+share one implementation.
 
 **Interactive Components in the GUI:**
 **Legend** — Tier **P** = primary, exposed by default. Tier **A** = advanced but
 editable. Tier **D** = documented, adjustability deliberately not implemented (plot
-cosmetics). Tier **—** = read-only or derived.
+cosmetics). Tier **—** = read-only, derived, or recorded but not acted on.
 
 ---
 
 ## Contents
 
-- [Version 0.1 Notes](#version-01-notes) — display names, I/O behaviour, closed gaps
+- [Build notes](#build-notes) — Index B, display names, I/O behaviour, closed gaps
 - [What the app reads and writes](#what-the-app-reads-and-writes)
 - [Session modes](#session-modes)
 - [Tab 1 · Dataset](#tab-1--dataset)
@@ -22,17 +29,47 @@ cosmetics). Tier **—** = read-only or derived.
 - [Tab 4 · Traces](#tab-4--traces)
 - [Tab 5 · Spike inference](#tab-5--spike-inference)
 - [Tab 6 · Analysis](#tab-6--analysis)
+- [How a job runs](#how-a-job-runs)
 - [Plotting](#plotting--documented-adjustability-not-implemented)
 - [Remaining gaps](#remaining-gaps)
+- [Scientific caveats](#scientific-caveats-that-travel-with-every-output)
 
 ---
 
-## Version 0.1 Notes
+## Build notes
 
-Three kinds of change: what controls are **called**, what the app **does with files**, and
-which of the spec's open gaps are now **closed**.
+Four things to know before reading the tab reference: **Index B is switched off**, what
+controls are **called**, what the app **does with files**, and which of the original
+spec's gaps are now **closed**.
 
-### 1. Display names
+### 1. Index B (the frequency-domain PCA) is disabled in this build
+
+Tab 6 runs **Index A only** — the inferred-rate features. Everything belonging to Index B
+(band-power and dominant-frequency features, its PCA, its dendrogram, its cut, the
+rate-vs-frequency agreement / adjusted Rand index, and its two figures) is commented out
+behind the marker `[Index B disabled]` in `spike_inference_gui.py`. `grep -n "\[Index B
+disabled\]" spike_inference_gui.py` lists every block that has to be un-commented to bring
+it back — 20-odd call sites, no deletions.
+
+The library functions it used (`features.freq_features`, `features.describe_bands`,
+`features.freq_group_summary`, `grouping.compare_partitions`) are **untouched and still
+work**; only the GUI call sites are switched off. What disappears from the window and the
+exports while it is off:
+
+| Gone from the GUI | Gone from the exports |
+|---|---|
+| the frequency-band table and its Nyquist caption | `freq_features.csv` |
+| the second k slider and `FREQ_CUT_HEIGHT` override | `pca_freq.npz` / `.json` / `pca_freq_scores.csv` |
+| the Index A/Index B preview selector (hidden, single entry) | `figures/pca_freq_summary.tiff`, `figures/dendrogram_freq.tiff` |
+| the FFT-bin-width note under the region slider | the `freq_group` column of `roi_groups.csv` |
+
+Two consequences worth stating outright. `CASCADE_DIR` is **no longer required to run the
+analysis** — it was demanded only because `freq_features` loads its FFT helper from
+`CascadeTorch/scripts`, and Index A never needed it. And `analysis_params.json` records
+`"index_b_frequency_pca": "disabled in this build"` rather than a band list, so an export
+from this build can be told apart from one made with both indices.
+
+### 2. Display names
 
 Tabs 1 and 2 dropped the notebook's `SHOUTING_CONSTANT` style for readable labels; tabs
 3–6 kept it. The underlying variable names in `analysis_tools/` are unchanged, so scripts
@@ -40,15 +77,21 @@ and `.params.json` sidecars still use the right-hand column.
 
 | Tab | GUI label | Underlying name | Note |
 |---|---|---|---|
-| 1 | **Data Directory** | `DATA_DIR` | |
-| 1 | **Calcium Indicator Channel** | `channel` | Was hard-coded `Ch0`; now a parameter. |
+| 1 | **Raw Data Directory** | `DATA_DIR` | |
+| 1 | **Use Channel...** | `channel` | Was hard-coded `Ch0`; now a parameter. |
 | 1 | **Fallback Freq. (Hz)** | `fallback_hz` | |
 | 2 | **Denoise Method** | `DENOISE_METHOD` | Checkboxes, not a text field. |
 | 2 | **[Gaussian] Sigma** | `DENOISE_SIGMA` | Bracket prefix marks which denoiser the knob belongs to — it does nothing unless that method is in the chain. |
 | 2 | **[NLM] Patch Size** | `NLM_PATCH_SIZE` | |
 | 2 | **[NLM] Patch Distance** | `NLM_PATCH_DISTANCE` | |
 | 2 | **[NLM] H-Factor** | `NLM_H_FACTOR` | |
-| 3–6 | unchanged | `START_TIMEPOINT`, `BASELINE_SLIDES`, `ACTIVE_THRESH`, `PCA_VAR_TARGET`, … | |
+| 2 | **Preprocessed Data Directory** | `PREPROCESSED_DIR` | |
+| 3 | **Labels Directory** | `LABELS_DIR` | |
+| 4 | **source .zarr** | — | New; no notebook equivalent. See [Tab 4](#tab-4--traces). |
+| 4–6 | unchanged | `START_TIMEPOINT`, `BASELINE_SLIDES`, `ACTIVE_THRESH`, `PCA_VAR_TARGET`, … | |
+
+Explanatory notes live behind the **ⓘ** badges rather than as permanent prose under each
+control. Hovering holds the note open for as long as the pointer stays on the badge.
 
 **Three controls the spec listed are no longer in the GUI at all:**
 
@@ -62,11 +105,13 @@ The last two still act on every frame; they are simply no longer adjustable from
 window. They remain fields of `preprocess.PreprocessParams` and are still written into
 each store's `.params.json`, so a run stays reproducible. Uncomment the three lines in
 `_build_preprocess_tab` and the matching lines in `_preprocess_params` to bring them back.
+The DCT denoiser itself is commented out of `analysis_tools/preprocess.py`, so
+`DENOISE_METHODS` is `("gaussian", "nlm")`.
 
 `ROI_MASK_PATH` also went away as a *field*. The path is now internal state set by the
 load/save dialogs — see [Tab 3](#tab-3--rois).
 
-### 2. I/O behaviour
+### 3. I/O behaviour
 
 **Outputs go where you say, per run — not to a derived folder.** This is the substantive
 change. Previously the analysis root plus `dataset_tag` determined every output path,
@@ -78,11 +123,10 @@ inference or a second analysis pass silently replaced the first.
 | Run CASCADE | wrote `spike_rate.npy` to `<root>/<tag>/` as a side effect | writes nothing; **asks** whether to save, then asks **where** |
 | Save inference | — (implicit) | own button, own folder dialog, refuses to clobber without confirming |
 | Load inference | read `<root>/<tag>/` | asks which folder to read |
-| Run analysis | wrote nine files to `<root>/<tag>/` | asks for the output folder **before** any compute |
+| Run analysis | wrote nine files to `<root>/<tag>/` | asks **once per session** for a parent folder, then writes an **auto-named subfolder per run** |
 
 `ANALYSIS_DIR` still exists, in tab 4, and still governs `save_traces` / `load_traces`.
-For inference and analysis it is only where the folder dialog opens; the dialog's *new
-folder* button is how runs are kept apart.
+For inference and analysis it is only where the folder dialog opens.
 
 **Other file-level changes:**
 
@@ -92,18 +136,21 @@ folder* button is how runs are kept apart.
   not zeros, which would read as "silent" rather than "not estimated". If the time axis
   and the rate disagree on length, a `frame` index column is written instead of `time_s`
   and the mismatch is logged.
-- **Trace extraction reads a named `.zarr` store**, not whatever is in the viewer. A new
+- **`analysis_params.json`** is written next to every analysis run: the window mode and
+  its frames/seconds, the phases, the frame rate, the pad count, the threshold **and where
+  it came from**, the PCA and cut settings, and the model name.
+- **Trace extraction reads a named `.zarr` store**, not whatever is in the viewer. A
   *source .zarr* field in tab 4 selects it. Extracting from the in-session lazy chain
   would re-run denoising and motion correction per frame — work already paid for — and
   would leave the traces' provenance as "whatever was loaded".
 - **Building a preprocessing chain prompts to save it.** A built chain is lazy: nothing is
   computed until something asks. Since extraction reads from a store on disk, an unsaved
   chain means paying the whole preprocessing cost again later.
-- **`CASCADE_DIR` is validated before the analysis starts.** Index B loads its FFT helper
-  from `CascadeTorch/scripts`; a missing one used to fail halfway, after the Index A CSVs
-  were already written.
+- **Saving a Zarr store adopts it.** After a save the session *reads the file it just
+  wrote*, so nothing downstream re-runs the chain. A guard refuses to re-save an adopted
+  store onto itself, which would delete the source mid-write and zero the contents.
 
-### 3. Gaps the spec listed that are now closed
+### 4. Gaps the spec listed that are now closed
 
 - **Compute kernels are lifted.** `analysis_tools/preprocess.py` (denoise chain,
   background normalisation, motion correction) and `analysis_tools/traces.py` (ROI
@@ -111,11 +158,16 @@ folder* button is how runs are kept apart.
 - **The `START_TIMEPOINT` bug is fixed.** The notebook allocated a per-ROI array of length
   `min(n_frames, start + count)` but wrote at absolute index `t`, so any non-zero start
   misaligned or overran the trace. `traces.extract_roi_traces` writes at an index relative
-  to the window. Non-zero starts are covered by test.
+  to the window.
 - **Long operations run off the UI thread** on a `QThreadPool`, with a progress bar and
   stdout mirrored into the log pane.
 - **napari opens alongside the window** rather than being driven by an IPython `%gui`
   magic.
+- **Models can be downloaded from inside the app** — tab 5 carries a searchable picker
+  over the 156-entry index. The repository ships **no weights**, only
+  `Pretrained_models/available_models_CascadeTorch.yaml`.
+- **The grouping can be previewed before anything is written**, and k dragged without
+  recomputation — see [Tab 6](#tab-6--analysis).
 
 ---
 
@@ -127,12 +179,22 @@ Every file the app touches, which tab touches it, and the function behind it. Al
 | Data | Tab | Direction | Format | Function |
 |---|---|---|---|---|
 | Frame images from an `.imgdir` | 1 | import | `ImageData_Ch<n>_TP*.npy` | `list_frames`, `load_frame`, `load_imgdir`, `load_timebase` |
+| Acquisition timebase | 1 | import | `ElapsedTimes.yaml` | `load_timebase` |
 | Preprocessed stack | 2 | import + export | `.zarr` + `.params.json` | `save_preprocessed`, `load_preprocessed` |
 | ROI labels | 3 | import + export | `.tiff` uint16 label image | `load_roi_labels`, `save_roi_labels` |
 | dF/F traces, many ROIs | 4 | import | `.csv` / `.npz` / `.npy` | `load_traces`, `import_dff` |
 | dF/F traces | 4 | export | `.npz` + `.csv` + `.json` | `save_traces` |
-| Inferred spike rate | 5 | import + export | `.npy` + `.csv` + `.json` | `cascade_runner.save` / `.load`, `_save_spike_rate_csv` |
-| PCA analysis + summary | 6 | export | `.csv` tables + `.tiff` figures | `save_pca`, `save_features`, `save_groups`, `save_figure` |
+| Pretrained model | 5 | import | `.zip` → model folder | `cascade_runner.model_index`, `download_model` |
+| Inferred spike rate | 5 | import + export | `.npy` + `.csv` + `.json` | `cascade_runner.save` / `.load`, `_save_spike_rate_csv` † |
+| Features + groups + PCA | 6 | export | `.csv` tables, `.npz` + `.json` | `save_features`, `save_groups`, `save_pca` |
+| Run parameters | 6 | export | `analysis_params.json` | `_save_analysis_params` † |
+| Figures | 6 | export | `.tiff` under `figures/` | `save_figure` |
+
+† defined in `spike_inference_gui.py`, not in `store.py`.
+
+`store.available(dir)` reports which of these artifacts exist on disk. The GUI does not
+currently use it — it gates on live session state instead — but it is there for scripts
+that want to tell an empty directory from a half-finished run.
 
 ---
 
@@ -142,18 +204,29 @@ Two entry points, and which one is active determines what is meaningful to show.
 
 ### Full mode — Import @ Tab 1
 
-All tabs live. Stages unlock in order as artifacts appear:
+All tabs live. What each stage needs before its buttons enable:
 
-| Artifact | Unlocks |
+| Action | Enabled once |
 |---|---|
-| `.imgdir` selected | Preprocessing |
-| `preprocessed/<tag>_<method>.zarr` | ROI panel |
-| an ROI label `.tiff` | Trace extraction |
-| traces in the session | Spike inference |
-| an inferred rate in the session | Analysis |
+| Load dataset | a path is in **Raw Data Directory** |
+| Build lazy stack | frames are loaded **and** a preprocessed directory is set |
+| Save to Zarr… | a stack has been built or loaded |
+| Load from Zarr | always (a `.zarr` is a complete entry point) |
+| New / Load ROI labels | a stack or a known frame shape exists |
+| Save ROI labels | labels exist in the session or in napari |
+| Extract traces | ROI labels exist **and** a source `.zarr` is named |
+| Save / Load traces | traces exist (save) and an analysis root is set |
+| Download models | `CASCADE_DIR` is set — no traces or ROIs needed |
+| Run CASCADE | traces exist **and** a model is selected |
+| Save inferred spikes… | CASCADE has been run **this session** (a rate loaded from disk is already saved) |
+| Load saved inference… | traces exist (tab 6 reads dF/F alongside the rate) |
+| Preview / Run analysis | an inferred rate is in the session |
 
-`store.available(dir)` reports which artifacts exist on disk — use it to drive gating
-rather than catching `FileNotFoundError`.
+Tabs 1–3 are enabled only in full mode; tabs 4 and 5 are always enabled; tab 6 unlocks
+when a spike rate is present. **Tab 5 stays enabled even with nothing loaded** — an empty
+`Pretrained_models/` has to be fillable on a fresh clone, and a disabled tab disables its
+downloader. Tab availability never tracks busy-ness; running jobs disable the action
+buttons instead, because disabling the current tab makes Qt jump focus to another one.
 
 ### Traces-only mode — Import @ Tab 4
 
@@ -164,13 +237,13 @@ are not stale, they are *absent*.
 the extraction window (`START_TIMEPOINT`, `EXTRACT_TIMEPOINTS`, `BASELINE_SLIDES`;
 imported traces are already baselined). Napari layers are cleared.
 
-**Live:** spike inference · phases · features · PCA · grouping · every export.
+**Live:** spike inference · phases and regions · features · PCA · grouping · every export.
 
 **The one thing that must be got right:** frame rate. There is no `ElapsedTimes.yaml` in
 this mode, so it comes from a time column in the imported file or from manual entry. It
-drives CASCADE resampling, the phase windows and the Nyquist ceiling on the frequency
-bands — a wrong value produces plausible-looking output that is wrong throughout.
-`import_dff` refuses to guess: no time column and no `frame_rate_hz` raises.
+drives CASCADE resampling and the phase windows — a wrong value produces plausible-looking
+output that is wrong throughout. `import_dff` refuses to guess: no time column and no
+`frame_rate_hz` raises.
 
 Switching modes clears downstream state rather than mixing provenance. The mode is
 recorded in every params sidecar written afterwards.
@@ -181,12 +254,15 @@ recorded in every params sidecar written afterwards.
 
 | GUI label | Tier | Widget | Default | Notes |
 |---|---|---|---|---|
-| **Data Directory** | P | directory picker | *(empty)* | The `.imgdir` frame dump. |
-| **Calcium Indicator Channel** | P | int spin | `0` | Selects `ImageData_Ch<n>_TP*.npy`. |
-| **Fallback Freq. (Hz)** | A | float | `10.0` | Used **only** when `ElapsedTimes.yaml` is missing or its length disagrees with the stack. The log says which was used. |
+| **Raw Data Directory** | P | directory picker | *(empty)* | The `.imgdir` frame dump. |
+| **Use Channel...** | P | int spin (0–8) | `0` | Selects `ImageData_Ch<n>_TP*.npy`. |
+| **Fallback Freq. (Hz)** | A | float | `10.0` | Used **only** when `ElapsedTimes.yaml` is missing or its length disagrees with the stack. The log says which was used. Also supplies the nominal axis when traces are extracted from a `.zarr` opened without its `.imgdir` — see [Tab 4](#tab-4--traces). |
 | frame count · shape · dtype | — | read-only | derived | Observed `(1024, 1376)` uint16. |
 | time source | — | read-only | derived | `ElapsedTimes.yaml` or `fallback`. |
 | `dataset_tag` | — | read-only | `DATA_DIR.name.split("-")[0]` → `Debi_DRG` | Every downstream filename keys off this. |
+
+Action: **Load dataset**. The stack is a lazy dask array, one frame per chunk — nothing is
+read beyond the first frame until something computes.
 
 Every path field starts empty. A blank field resolves to `None`, never to the working
 directory — an accidental `Path("")` would silently target the repo root.
@@ -202,11 +278,18 @@ directory — an accidental `Path("")` would silently target the repo root.
 | **[NLM] Patch Size** | P | int | `5` | px. |
 | **[NLM] Patch Distance** | P | int | `6` | px search radius. |
 | **[NLM] H-Factor** | P | float | `1.25` | Cut-off, multiplied by the per-frame `estimate_sigma`. |
-| `PREPROCESSED_DIR` | A | directory picker | *(empty)* | Zarr cache location. |
-| resolved path | — | read-only | derived | `<dataset_tag>_<method_tag>.zarr`, plus which chains are already cached. |
+| **Preprocessed Data Directory** | A | directory picker | *(empty)* | Zarr cache location. |
+| resolved path | — | read-only | derived | `<dataset_tag>_<method_tag>.zarr`, which chains are already cached, or — when the path cannot be resolved — exactly which of the three prerequisites is missing. |
 
-Not exposed, see [display names](#1-display-names): `BACKGROUND_PERCENTILE` (`4`),
+Not exposed, see [display names](#2-display-names): `BACKGROUND_PERCENTILE` (`4`),
 `upsample_factor` (`10`), `DCT_THRESHOLD_FRACTION` (deprecated with the DCT denoiser).
+
+### What the chain does, per frame
+
+`preprocess.preprocess_frame`, in order: denoise (the checked methods in sequence) →
+subtract the 4th-percentile background → rigid motion correction against a fixed reference
+(`phase_cross_correlation`, `upsample_factor=10`, sub-pixel shift) → clip at zero, float32.
+The reference is frame 0 put through the same denoise + background steps, computed once.
 
 **The trap this panel is built around:** the output filename embeds the denoise chain.
 Changing the method silently retargets which store is saved *and* loaded — switch the
@@ -215,11 +298,9 @@ work you believe you did. The resolved path sits next to the control for that re
 
 Actions: **Build lazy stack** (wires the chain, computes nothing, then offers to save) ·
 **Save to Zarr…** (computes every frame; confirms before overwriting) · **Load from Zarr**
-(a complete entry point — available without loading a dataset first).
-
-Saving adopts the store: the session afterwards *reads* the file it just wrote, so
-extraction does not re-run the chain. A guard refuses to re-save an adopted store onto
-itself, which would delete the source mid-write and zero the contents.
+(a complete entry point — available without loading a dataset first; the tag and the
+denoise chain are read back out of the store's `<dataset_tag>_<method>.zarr` name and the
+checkboxes are re-pointed at what the store was actually built with).
 
 ---
 
@@ -227,13 +308,14 @@ itself, which would delete the source mid-write and zero the contents.
 
 | GUI label | Tier | Widget | Default | Notes |
 |---|---|---|---|---|
-| `LABELS_DIR` | A | directory picker | *(empty)* | **Only** sets where the load/save dialogs open. |
+| **Labels Directory** | A | directory picker | *(empty)* | **Only** sets where the load/save dialogs open. |
 | label dtype | — | fixed | `uint16` | |
-| overlay opacity | D | — | `0.6` | Not adjustable yet. |
+| overlay opacity | D | — | `0.6` | Hard-coded in `_add_labels_layer`. |
 
 The ROI label path is **not** a field. Load and save each open their own dialog and record
 what the dialog returned, so the recorded path always reflects the file actually used —
-never a stale field someone edited by hand. It is written into `traces_params.json`.
+never a stale field someone edited by hand. It is written into `traces_params.json`. The
+dialogs suggest `<dataset_tag>_ROI.tiff` and reopen at the last file used.
 
 Actions: **New blank ROI labels** (sized to the preprocessed stack) · **Load ROI labels**
 (raises on a shape mismatch against the stack — shown as a dialog, since the alternative
@@ -245,9 +327,11 @@ press <kbd>M</kbd> for a fresh label id per ROI.
 
 **The ROI count is never stored.** It is derived from the current label image everywhere
 it appears — the tab 3 readout reads the live napari layer, so a painted ROI is counted
-without saving first, and extraction derives `roi_ids` the same way. Note that importing a
-new label set does **not** invalidate traces already extracted from an older one; re-run
-extraction after changing labels.
+without saving first, and extraction derives `roi_ids` the same way (`traces.roi_ids_in`,
+which counts non-zero labels rather than `len(unique) - 1`, so a label image with no
+background pixel is not undercounted). Note that importing a new label set does **not**
+invalidate traces already extracted from an older one; re-run extraction after changing
+labels.
 
 This build renders no max/STD projection.
 
@@ -261,11 +345,11 @@ This build renders no max/STD projection.
 | `START_TIMEPOINT` | P | int | `0` | First frame of the window. |
 | `EXTRACT_TIMEPOINTS` | P | int | `500` | Frames to extract (≈50 s at 10 Hz). |
 | `BASELINE_SLIDES` | P | int | `20` | Leading frames averaged into F0 (≈2 s). Interacts with the `pre` phase — see tab 6. |
-| Analysis root | A | directory picker | *(empty)* | `<root>/<dataset_tag>/` for `save_traces` / `load_traces`. Also the starting point for the tab 5/6 output dialogs. |
+| Analysis root | A | directory picker | *(empty)* | `<root>/<dataset_tag>/` for `save_traces` / `load_traces`. Also where the tab 5/6 output dialogs open. |
 | import file | P | file picker | — | Traces-only entry. `.csv` / `.npz` / `.npy`. |
-| `orientation` | P | dropdown | `auto` | `roi_rows` \| `roi_cols` \| `auto`. Auto reads a table with a time column as one column per ROI; otherwise the longer axis is time. |
-| `time_column` | A | text | `auto` | Column name or index, `auto`, or none. Auto accepts a column named time/t/seconds, or a strictly increasing numeric first column in a taller-than-wide table — a `roi` id column is explicitly not mistaken for one. |
-| `frame_rate_hz` | P *(traces-only)* | float | — | **Required** when the file carries no time axis. |
+| `orientation` | P | dropdown | `auto` | `auto` \| `roi_rows` \| `roi_cols`. Auto reads a table with a time column as one column per ROI; otherwise the longer axis is time. |
+| `time_column` | A | text | `auto` | Column name or index, `auto`, or `none`. Auto accepts a column named time/t/seconds, or a strictly increasing numeric first column in a taller-than-wide table — a `roi` id column is explicitly not mistaken for one. |
+| `frame_rate_hz` | P *(traces-only)* | float | `0.0` = unset | **Required** when the file carries no time axis. |
 
 ### How the traces are computed
 
@@ -273,7 +357,7 @@ Three stages, in `analysis_tools/traces.py`:
 
 1. **Spatial mean** — for ROI *r* with pixel set `P_r = {(y,x) : L(y,x) = r}` from the
    label image `L`: `F_r(t) = (1/|P_r|) · Σ I(t,y,x)`. Unweighted, no neuropil
-   subtraction.
+   subtraction. Frames are materialised one at a time, so the movie is never in RAM.
 2. **Baseline** — `F0_r = mean(F_r[0 : BASELINE_SLIDES])`. A fixed leading window, not a
    rolling percentile; it assumes the recording starts quiet.
 3. **Normalisation** — `ΔF/F_r(t) = (F_r(t) − F0_r) / F0_r`.
@@ -283,6 +367,11 @@ denoised, background-subtracted at the 4th percentile, motion-corrected and clip
 zero. That subtraction shrinks `F0` and therefore inflates ΔF/F relative to the same
 computation on raw camera counts — and it is why `F0 = 0` is a live failure mode, guarded
 explicitly. Both `F` and ΔF/F are kept and saved.
+
+Extraction re-checks the label shape against the store it is reading and refuses a
+mismatch. If the store was opened without its `.imgdir` there is no acquisition timebase,
+so the time axis is nominal at the tab 1 **Fallback Freq.** — said out loud in the log,
+because that number feeds CASCADE resampling.
 
 Export writes three files via `store.save_traces`: `traces.npz` (exact, including the raw
 pre-dF/F traces), `traces.csv` (portable — `time_s` plus one column per ROI), and
@@ -295,27 +384,53 @@ options, frame rate, ROI/frame counts).
 
 | GUI label | Tier | Widget | Default | Notes |
 |---|---|---|---|---|
-| `CASCADE_DIR` | A | directory picker | *(empty)* | e.g. `./CascadeTorch`. Also supplies the FFT helper used by Index B in tab 6. |
-| `MODEL_NAME` | P | dropdown | `Spinal_cord_excitatory_30Hz_smoothing50ms` | From `cascade_runner.available_models()`; models are read from `<CASCADE_DIR>/Pretrained_models`. |
+| `CASCADE_DIR` | A | directory picker | *(empty)* | e.g. `./CascadeTorch`. Models are read from `<CASCADE_DIR>/Pretrained_models`. |
+| `MODEL_NAME` | P | dropdown | `Spinal_cord_excitatory_30Hz_smoothing50ms` *(if installed)* | From `cascade_runner.available_models()` — a folder is listed only once its `config.yaml` is there, so an interrupted download is not offered. |
 
 The panel shows what `cascade_runner.check_model()` prints, inline and before the run:
 training rate parsed from the **name** vs the rate in `config.yaml` (at least one shipped
-model disagrees), the indicator the model was trained on (GCaMP6 vs 8 mismatch), the
-resample ratio, and the pad frames that will be NaN at each edge.
+model disagrees), the training datasets, the smoothing and window size, the resample plan
+in both directions, an explicit warning that upsampling adds no information, an indicator
+mismatch warning (GCaMP6 model vs GCaMP8 recording), and the pad frames that will be NaN
+at each edge.
 
 Model choice is a scientific claim, not a preference. The default is a spinal dorsal-horn
-model applied to DRG — the nearest available analogue, and an untested transfer
-(`CLAUDE.md` §4C, App. A §8). No DRG-specific ground truth exists. The panel carries that
-caveat where the user picks, not only in the writeup.
+model applied to DRG — the nearest available analogue, and an untested transfer. No
+DRG-specific ground truth exists. The panel carries that caveat where the user picks, not
+only in the writeup.
+
+### Downloading models
+
+The repository ships **no weights** — only the index,
+`Pretrained_models/available_models_CascadeTorch.yaml` (156 entries). **Download
+pretrained models…** opens a picker over that index: filter by name or family, hide what
+is installed, and sort by the columns *Model · Installed · Family · Rate (Hz) · Smoothing
+(ms) · Noise*. The rate and smoothing are parsed out of the name, because the property
+that decides whether a model suits a recording is buried mid-string. Nothing is fetched to
+build the list. Models on disk but absent from the index (hand-placed or retrained
+folders) are named at the bottom rather than left to make the two counts disagree.
+
+The download stages into a temp folder and replaces an existing copy **only after** the
+new one has extracted cleanly and its `config.yaml` is present, so a failed re-download
+cannot destroy a working model. The newly installed model is then selected in `MODEL_NAME`.
+
+### Inference
+
+`cascade_runner.run` measures noise levels at the **native** frame rate (the metric is a
+median frame-to-frame difference, and interpolated frames are correlated by construction),
+resamples the traces to the model rate with polyphase `resample_poly` — NaN-preserving —
+runs `cascade.predict` on CPU with `padding=np.nan`, converts spikes/frame to spikes/s by
+multiplying by the grid rate **before** resampling back, and returns to the acquisition
+grid.
 
 Actions: **Run CASCADE** · **Save inferred spikes…** · **Load saved inference…**
 
 Running writes nothing by itself. It offers to save, and saving asks for a destination
-folder rather than deriving one — see [I/O behaviour](#2-io-behaviour). Declining keeps the
+folder rather than deriving one — see [I/O behaviour](#3-io-behaviour). Declining keeps the
 rate in the session with the Save button live; it is lost only when the window closes.
 Loading asks for a folder too, otherwise a run saved outside the derived path could never
 be read back, and it clears the in-memory result so a rate that is already on disk is not
-duplicated.
+duplicated. Adopting a rate whose ROI count disagrees with the loaded traces is refused.
 
 Written on save: `spike_rate.npy`, `spike_rate.csv`, `spike_inference_params.json`.
 
@@ -323,80 +438,155 @@ Written on save: `spike_rate.npy`, `spike_rate.csv`, `spike_inference_params.jso
 
 ## Tab 6 · Analysis
 
+Split into two sub-tabs: **Setup** holds the controls, **Live preview** the canvases.
+
+### Analysis window — phases *or* one region, never both on screen
+
+A pair of radio buttons swaps the panel below them.
+
 | GUI label | Tier | Widget | Default | Notes |
 |---|---|---|---|---|
-| Stimulus phases | P | editable table, name → (start, end) s | `pre (2,10)`, `stim (10,15)`, `post (15,50)` | `pre` starts at 2.0 s, not 0, because frames `0..BASELINE_SLIDES` *defined* F0 — dF/F there is ~0 by construction and would fake a silent baseline. |
-| Index B frequency bands | P | editable band table | `(0.2,0.5) (0.5,1.0) (1.0,2.0) (2.0,5.0)` Hz | Upper edge guarded against Nyquist, with a tolerance: a measured 9.999999 Hz must not reject the documented 5.0 Hz edge on floating-point margin. |
-| `ACTIVE_THRESH` | P | float + auto toggle | auto | spikes/s. Auto = baseline median + `ACTIVE_N_SIGMA` × robust sigma. |
+| **Chop up into phases** | P | editable table, name → (start, end) s | `pre (2,10)`, `injury (10,15)`, `post (15,50)` | Rows can be added and removed. `pre` starts at 2.0 s, not 0, because frames `0..BASELINE_SLIDES` *defined* F0 — dF/F there is ~0 by construction and would fake a silent baseline. The **first** phase is also the `ACTIVE_THRESH` baseline. |
+| **Select a region** | P | range slider + two frame spins | whole recording | The analysis runs on this window only, as a single phase named `region_<t0>-<t1>s`. Until a handle is dragged the region tracks the entire recording. |
+| region readout | — | read-only | derived | Frames, seconds and duration of the current region. |
+
+In region mode everything is cropped to the selected frames and the NaN **pad count is
+recounted on the crop** — `session.pad` describes CASCADE's pad at the ends of the *full*
+trace, and a crop may exclude it entirely or land inside it. And `ACTIVE_THRESH` is
+measured **before** the region, not inside it: a threshold taken from the window under test
+is set by the very response it is meant to detect. A region starting at frame 0 has nothing
+before it, so the threshold falls back to the region itself — which is circular, and said
+so in the log.
+
+### Thresholds, PCA and clustering
+
+| GUI label | Tier | Widget | Default | Notes |
+|---|---|---|---|---|
+| `ACTIVE_THRESH` | P | checkbox + float | auto | Auto = baseline median + `ACTIVE_N_SIGMA` × robust (MAD) sigma. Unticking enables the manual spikes/s box. |
 | `ACTIVE_N_SIGMA` | P | float | `3.0` | A fixed absolute threshold does not transfer between models. |
-| `PCA_VAR_TARGET` | P | float 0–1 | `0.95` | Cumulative variance target selecting the PC count. |
-| `MAX_K` | A | int | `8` | Largest k in the candidate-cut table. |
-| `MIN_GROUP_SIZE` | A | int | `3` | A "group" of 1–2 ROIs is an outlier, not a population. |
-| `MAX_GROUP_FRAC` | A | float | `0.9` | One group holding almost everything is not a partition. |
-| `RATE_CUT_HEIGHT` | P | float, blank = auto | auto | Manual dendrogram cut for Index A; blank → `grouping.suggest_cut`. |
-| `FREQ_CUT_HEIGHT` | P | float, blank = auto | auto | Same for Index B. |
+| `PCA_VAR_TARGET` | P | float 0.05–1 | `0.95` | Cumulative variance target selecting the PC count. |
+| `MAX_K` | A | int | `12` | Caps the k slider and the printed candidate-cut table. |
+| `MIN_GROUP_SIZE` | — | int | `3` | **Recorded into `analysis_params.json`, but not acted on in this build** — it is a parameter of `grouping.suggest_cut`, which the GUI no longer calls now that the cut is set by k or by an explicit height. |
+| `MAX_GROUP_FRAC` | A | float | `0.9` | One group holding more than this share triggers the degenerate-partition warning. |
+| **Index A groups (k)** | P | slider 2–`MAX_K` | `4` | Cuts the tree with `fcluster(maxclust)`. The equivalent height is shown beside the slider and written to `analysis_params.json`, so k-specified runs stay comparable with height-specified ones. |
+| `RATE_CUT_HEIGHT` override | P | text, blank = use k | blank | Pins a height; takes precedence over k **in the export**. The live preview always uses k. |
 
-Clicking **Run analysis and export** validates `CASCADE_DIR`, then asks for the output
-folder, then computes. Exports, all into the folder chosen for that run:
+### Live preview
 
-- `rate_features.csv`, `freq_features.csv` — `store.save_features`
-- `roi_groups.csv` — `store.save_groups`
-- `pca_rate.npz` / `pca_freq.npz` + `.json` + `pca_<label>_scores.csv` — `store.save_pca`
-- `figures/*.tiff` — `store.save_figure` on the figure each `plots.*` function returns:
-  `pca_rate_summary`, `dendrogram_rate`, `rate_heatmap`, `rate_group_means`,
-  `pca_freq_summary`, `dendrogram_freq`
+**Preview (no files written)** computes the features, the PCA and the linkage — everything
+*except* the cut — and draws three panels: the dendrogram, the ROIs in PC space coloured by
+group, and the group-mean inferred rate with each member ROI behind it. Dragging k then
+re-cuts the stored tree and redraws, with no recomputation (debounced to one redraw per
+120 ms, since each costs ~100–200 ms).
+
+Between the scatter and the traces sits an explainer stating what the PCA actually
+measures — three numbers per ROI per phase, z-scored, distances Euclidean in the leading
+PCs — which features PC1 and PC2 load on for *this* fit, and the threshold with its
+provenance. The grouping is easy to over-read: the distances are between per-phase summary
+statistics, not between traces.
+
+Changing the phases, the region or `MAX_K` clears the preview and says so, rather than
+leaving figures up for a window you are no longer looking at. See
+[Remaining gaps](#remaining-gaps) for the settings that do **not** clear it.
+
+### Export
+
+**Run analysis and export (CSV + TIFF)** asks once per session for a **parent** folder,
+then writes an auto-named subfolder per run: `<window>_<cut>`, e.g.
+`phases_pre-injury-post_k4` or `region_12.0-30.0s_h1.85`. An existing non-empty folder of
+the same name asks before it is overwritten, so two different configurations never
+collide.
+
+Into that folder:
+
+- `rate_features.csv` — per-ROI mean rate, peak rate and active fraction per phase, joined
+  with the descriptive dF/F summary and the group column (`store.save_features`)
+- `roi_groups.csv` — `roi` → `rate_group` (`store.save_groups`)
+- `pca_rate.npz` + `pca_rate.json` + `pca_rate_scores.csv` (`store.save_pca`)
+- `analysis_params.json` — everything needed to reproduce the run
+- `figures/*.tiff` (`store.save_figure`): `pca_rate_summary`, `dendrogram_rate`,
+  `rate_heatmap`, `rate_group_means`
+
+The log also carries the candidate-cut table (k, height, merge gap, group sizes), the
+per-group phase profile with its `dominant_phase` column, and the ROI membership of every
+group.
 
 `save_pca` stores scores, loadings, explained variance and the linkage matrix — enough to
 re-plot and re-cut — but **not** the `StandardScaler` statistics, so it cannot project new
 ROIs into a saved PCA space. The PCA is per-dataset; there is nothing to project.
 
-Figures are drawn on the UI thread after the numeric work finishes in the worker. pyplot
-is not thread-safe: building figures inside the worker deadlocks against the Qt event loop
-at 0% CPU and never returns.
+Group labels are an arbitrary integer labelling, not a cell type. `dominant_phase` is an
+argmax over three means — with a single trial it ranks, it does not test.
 
-Group labels are an arbitrary integer labelling, not a cell type.
+---
+
+## How a job runs
+
+Every long operation goes through one path, so the behaviour is the same everywhere.
+
+- One job at a time, on a `QThreadPool` capped to a single thread — stdout capture is
+  global, so a second concurrent job would interleave its log lines into the first.
+- The job's stdout is redirected into the log pane, which is why `analysis_tools`
+  functions communicate by `print` and everything they say ends up on screen.
+- `progress` callbacks drive the progress bar (trace extraction, model download).
+- On success the completion handler runs back on the UI thread; on failure the traceback
+  goes to the log and its last line into a dialog. Either way the action buttons re-enable.
+- Figures are drawn on the UI thread after the numeric work finishes. `analysis_tools.plots`
+  builds bare `Figure` objects and never touches pyplot, so nothing leaks into pyplot's
+  global figure manager or drags its thread affinity into the Qt event loop.
 
 ---
 
 ## Plotting — documented, adjustability not implemented
 
 Listed so the eventual controls are known. These are currently constants in the plot
-functions.
+functions (`analysis_tools/plots.py`) or in `store.save_figure`.
 
 | Option | Current value | Where |
 |---|---|---|
-| dF/F heatmap colormap | `magma` | `plots.rate_heatmap` |
-| max-projection colormap | `coolwarm` | notebook projection cells |
-| robust colour limits | 1st / 99th percentile | notebook QC plot |
-| heatmap `vmax` | `nanpercentile(99)` | `plots.rate_heatmap` |
-| figure dpi | `200` | `store.save_figure` |
-| figsize rules | `(12, 0.18·n_rois + 2)`, `(12, 1.9·n_groups + 1.2)`, `(16, 4.4)`, `(13, 4.6)` | `plots.*` |
-| trace linewidth | `0.6` | notebook QC plot |
+| inferred-rate heatmap colormap | `magma` | `plots.rate_heatmap` |
+| heatmap colour limits | `vmin=0`, `vmax=nanpercentile(99)` | `plots.rate_heatmap` |
+| group colours | `C0`–`C9`, cycled — colours repeat past 10 groups | `plots.GROUP_COLORS` |
+| figure dpi / format | `200`, TIFF, `bbox_inches="tight"` | `store.save_figure` |
+| figsize rules | `(16, 4.4)` pca_summary · `(6.4, 4.6)` pca_scatter · `(13, 4.6)` dendrogram · `(12, 0.18·n_rois + 2.2)` heatmap · `(12, 1.9·n_groups + 1.2)` group means | `plots.*` |
 | `SHOW_ROI_TRACES` | `True` | member ROIs behind group means |
-| `ROI_TRACE_ALPHA` | `0.3` | |
-| stimulus shading | the `stim` phase | `plots.rate_heatmap`, `plots.group_means` |
+| `ROI_TRACE_ALPHA` | `0.3`, linewidth `0.5` | `plots.group_means` |
+| group-mean linewidth / SEM alpha | `1.2` / `0.35` | `plots.group_means` |
+| stimulus shading | grey `axvspan` (group means), white dashed edges (heatmap) | `plots.group_means`, `plots.rate_heatmap` |
+| napari ROI overlay opacity | `0.6` | `_add_labels_layer` |
+| preview canvas heights | `4.6" / 4.6" / 6.0"` at 100 dpi | `_build_preview_page` |
 
-Constraints that are **not** preferences and stay fixed even once this panel is built
-(`CLAUDE.md` §5): perceptually-uniform colormaps only, never `jet`; raw and inferred
-traces in separate subplot rows or visually distinct; every panel showing inferred spikes
-names the algorithm and its parameters in that same panel.
+The shaded stimulus band is the phase named `stim`; with no such phase it is the **second**
+phase in the table, or the only one in region mode. The default phase names in this build
+are `pre / injury / post`, so the shaded band is `injury` unless a phase is renamed.
+
+Constraints that are **not** preferences and stay fixed even once this panel is built:
+perceptually-uniform colormaps only, never `jet`; raw and inferred traces in separate
+subplot rows or visually distinct; every panel showing inferred spikes names the algorithm
+and its parameters in that same panel.
 
 ---
 
 ## Remaining gaps
 
-1. **Napari runs as a separate top-level window**, not embedded in the Qt app. Workable,
+1. **Index B is disabled** — see [build notes](#1-index-b-the-frequency-domain-pca-is-disabled-in-this-build). The code is commented, not deleted.
+2. **Not every setting invalidates the live preview.** The phases, the region and `MAX_K`
+   clear it; `PCA_VAR_TARGET`, `ACTIVE_N_SIGMA`, the manual `ACTIVE_THRESH` and the
+   auto/manual toggle do **not** — the preview keeps showing the fit it was computed with
+   until Preview is pressed again. (`MAX_GROUP_FRAC` is read live at each re-cut, and the
+   `RATE_CUT_HEIGHT` override is ignored by the preview entirely.)
+3. **`MIN_GROUP_SIZE` is inert** — recorded in `analysis_params.json`, but nothing reads it
+   now that `grouping.suggest_cut` is no longer called.
+4. **Napari runs as a separate top-level window**, not embedded in the Qt app. Workable,
    but the two windows can be lost behind each other.
-2. **Jobs are not cancellable.** They run off the UI thread with a progress bar, but a
+5. **Jobs are not cancellable.** They run off the UI thread with a progress bar, but a
    long Zarr write has to be waited out.
-3. **New ROI labels do not invalidate existing traces.** Importing a label set after
+6. **New ROI labels do not invalidate existing traces.** Importing a label set after
    extracting leaves the old `roi_ids` and dF/F in the session, and tabs 5–6 stay
    enabled. Re-extract after changing labels.
-4. **No projection rendering.** The max/STD projection layers the notebook used for ROI
+7. **No projection rendering.** The max/STD projection layers the notebook used for ROI
    reference are not built here; ROI labels are sized against the preprocessed stack.
-5. **Plot adjustability** — the table above.
-6. **`labels/Debi_DRG_ROI.csv`** exists on disk but nothing reads or writes it. Decide
-   whether it is an input format worth supporting or a leftover.
+8. **Plot adjustability** — the table above.
 
 ---
 
@@ -409,14 +599,15 @@ names the algorithm and its parameters in that same panel.
 - Default CASCADE models are GCaMP6-tuned; applied to GCaMP8 they misestimate rates at
   both ends of the range.
 - **ΔF/F amplitude is not a rate proxy.** The `dff_peak_*` columns in the exports are
-  descriptive only.
+  descriptive only and feed no PCA.
+- Upsampling a recording to a faster model's rate adds **no** information; true resolution
+  stays at the acquisition rate whatever the model label says.
 - For DRG the honest deliverable is **burst / relative rate, not absolute spike counts**.
 
 ## AI Declaration
 Scripts and documentation are created with the help of Claude Code and Codex, prompted by Bo-Yu Chen and Sun-Hsing Ho.
 
 Contact @leolopster on Telegram for any enquiries.
-
 
 ---
 ---
