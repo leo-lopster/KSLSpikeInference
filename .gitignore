@@ -6,6 +6,7 @@
 *.zarr
 *.DS_Store
 
+/analysis/*
 /_projectnotes/*
 /datasets/*
 /preprocessed/*

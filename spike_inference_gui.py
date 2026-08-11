@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import sys
 import traceback
 from dataclasses import dataclass, field
@@ -44,13 +45,13 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg  # noqa: E402
 from qtpy.QtCore import (  # noqa: E402
     QEvent, QObject, QPoint, QRunnable, Qt, QThreadPool, QTimer, Signal, Slot,
 )
-from qtpy.QtGui import QColor, QFontDatabase  # noqa: E402
+from qtpy.QtGui import QColor, QFontDatabase, QFontMetrics  # noqa: E402
 from qtpy.QtWidgets import (  # noqa: E402
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea, QSlider,
-    QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QRadioButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 from superqt import QLabeledRangeSlider  # noqa: E402
 
@@ -391,6 +392,171 @@ def _help_label(name, help_text):
     layout.addWidget(_HelpIcon(help_text))
     layout.addStretch(1)
     return row
+
+
+class _ModelPickerDialog(QDialog):
+    """Pick one pretrained model out of the download index.
+
+    Chooses only -- the caller runs the download, so the job keeps the main window's
+    progress bar, log and error handling. Replaces a 156-entry combo box: the names alone
+    do not say which model suits a recording, and the property that decides it (the
+    training rate) is buried mid-string, so the table breaks it out into a sortable column.
+
+    Everything shown is parsed from the index; nothing is fetched. Verified against all
+    156 entries: each name carries a `<rate>Hz` and a `smoothing<N>ms` token.
+    """
+
+    COLUMNS = ["Model", "Installed", "Family", "Rate (Hz)", "Smoothing (ms)", "Noise"]
+
+    def __init__(self, model_dir, index, installed, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Pretrained models")
+        self._names = sorted(index)
+        self._installed = set(installed)
+
+        layout = QVBoxLayout(self)
+
+        filter_row = QHBoxLayout()
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("filter by name or family — e.g. spinal, 30Hz, GC8s")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.hide_installed_check = QCheckBox("hide installed")
+        self.hide_installed_check.stateChanged.connect(self._apply_filter)
+        filter_row.addWidget(QLabel("Filter"))
+        filter_row.addWidget(self.filter_edit, 1)
+        filter_row.addWidget(self.hide_installed_check)
+        layout.addLayout(filter_row)
+
+        self.table = QTableWidget(len(self._names), len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self._fill_table()
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(0, Qt.SortOrder.AscendingOrder)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, len(self.COLUMNS)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.itemDoubleClicked.connect(lambda _item: self._accept_if_selected())
+        layout.addWidget(self.table, 1)
+        self.resize(self._preferred_width(), 580)
+
+        self.status = _info()
+        layout.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.download_button = QPushButton("Download")
+        self.download_button.setDefault(True)
+        self.download_button.setEnabled(False)
+        self.download_button.clicked.connect(self._accept_if_selected)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.download_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        # Models on disk but absent from the index -- hand-placed or retrained folders --
+        # are usable but cannot be re-downloaded, so they are named rather than left to
+        # make the two counts silently disagree.
+        self._unlisted = sorted(self._installed - set(index))
+        self._apply_filter()
+
+    def _preferred_width(self):
+        """Wide enough for the longest model name, capped to the screen.
+
+        Sized from the content rather than a round number: the Model column stretches
+        into whatever the fixed columns leave behind, and at a hardcoded 880 px that came
+        to 393 px against the 424 px the longest name needs — so the longest names, the
+        ones hardest to tell apart, were the ones elided.
+        """
+        # Each column is as wide as the wider of its contents and its header: the values
+        # under "Smoothing (ms)" are all narrower than that title, and counting only the
+        # contents under-measured the fixed columns by ~190 px, which came straight out of
+        # the stretching Model column.
+        header = self.table.horizontalHeader()
+        def column_width(col):
+            return max(self.table.sizeHintForColumn(col), header.sectionSizeHint(col))
+
+        width = sum(column_width(c) for c in range(len(self.COLUMNS)))
+        width += 72  # scrollbar, frame, cell padding
+        screen = self.screen()
+        if screen is not None:
+            width = min(width, int(screen.availableGeometry().width() * 0.9))
+        return max(720, width)
+
+    # --- table -----------------------------------------------------------------------
+    def _fill_table(self):
+        for row, name in enumerate(self._names):
+            here = name in self._installed
+            first = QTableWidgetItem(name)
+            # The name travels in UserRole, never read back out of the cell text, so an
+            # elided or decorated cell can never become a filesystem path.
+            first.setData(Qt.ItemDataRole.UserRole, name)
+            self.table.setItem(row, 0, first)
+            self.table.setItem(row, 1, QTableWidgetItem("✓" if here else ""))
+            self.table.setItem(row, 2, QTableWidgetItem(re.split(r"[_-]", name)[0]))
+            self.table.setItem(row, 3, _numeric_item(_model_rate(name)))
+            self.table.setItem(row, 4, _numeric_item(_model_smoothing_ms(name)))
+            self.table.setItem(row, 5,
+                               QTableWidgetItem("high" if name.endswith("_high_noise")
+                                                else "standard"))
+
+    def _apply_filter(self):
+        needle = self.filter_edit.text().strip().lower()
+        hide_installed = self.hide_installed_check.isChecked()
+        shown = 0
+        for row in range(self.table.rowCount()):
+            name = self.table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+            hidden = (needle and needle not in name.lower()) or \
+                     (hide_installed and name in self._installed)
+            self.table.setRowHidden(row, bool(hidden))
+            shown += not hidden
+        note = (f"<br>{len(self._unlisted)} local model(s) not in the index: "
+                f"{', '.join(self._unlisted)}" if self._unlisted else "")
+        self.status.setText(
+            f"<b>{len(self._installed & set(self._names))}</b> of <b>{len(self._names)}</b> "
+            f"listed model(s) installed · <b>{shown}</b> shown{note}")
+
+    # --- selection -------------------------------------------------------------------
+    def _on_selection_changed(self):
+        self.download_button.setEnabled(self.selected_model() is not None)
+
+    def selected_model(self):
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not rows:
+            return None
+        return self.table.item(rows[0].row(), 0).data(Qt.ItemDataRole.UserRole)
+
+    def _accept_if_selected(self):
+        if self.selected_model() is not None:
+            self.accept()
+
+
+def _model_rate(name):
+    """Training rate in Hz parsed out of a model name, or 0.0 when it carries none."""
+    try:
+        return at.cascade_runner.model_rate_from_name(name)
+    except ValueError:
+        return 0.0
+
+
+def _model_smoothing_ms(name):
+    match = re.search(r"smoothing_?(\d+)ms", name)
+    return float(match.group(1)) if match else 0.0
+
+
+def _numeric_item(value):
+    """A cell that sorts by magnitude, not alphabetically ('10' before '7.5')."""
+    item = QTableWidgetItem()
+    item.setData(Qt.ItemDataRole.EditRole, float(value))
+    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    return item
 
 
 # =============================================================================
@@ -954,7 +1120,7 @@ class PipelineWindow(QMainWindow):
         form.addRow(self.extract_btn)
         layout.addWidget(self.extract_box)
 
-        export_box = QGroupBox("Export / reload")
+        export_box = QGroupBox("Export traces")
         export_layout = QVBoxLayout(export_box)
         self.analysis_dir_edit = _path_edit("(none selected) — e.g. ./analysis")
         self.analysis_dir_edit.textChanged.connect(self._refresh_gating)
@@ -1209,22 +1375,18 @@ class PipelineWindow(QMainWindow):
         self.model_info = _info()
         layout.addWidget(self.model_info)
 
-        download_box = QGroupBox("Download pretrained models")
-        download_form = _form(download_box)
-        self.download_combo = _combo()
-        download_form.addRow(_help_label(
-            "model",
+        download_row = QHBoxLayout()
+        self.download_btn = QPushButton("Download pretrained models…")
+        self.download_btn.clicked.connect(self._on_download_model)
+        download_row.addWidget(self.download_btn)
+        download_row.addWidget(_HelpIcon(
             "The repository ships no model weights — only the index of download links, "
             "Pretrained_models/available_models_CascadeTorch.yaml. Downloaded models land "
             "in CASCADE_DIR/Pretrained_models/<name>/ and appear in MODEL_NAME above. A "
             "model is a few MB to tens of MB; the list is whatever that index file says, "
-            "nothing is fetched to build it."), self.download_combo)
-        self.download_btn = QPushButton("Download selected model")
-        self.download_btn.clicked.connect(self._on_download_model)
-        download_form.addRow(self.download_btn)
-        self.download_info = _info()
-        download_form.addRow(self.download_info)
-        layout.addWidget(download_box)
+            "nothing is fetched to build it."))
+        download_row.addStretch(1)
+        layout.addLayout(download_row)
 
         buttons = QHBoxLayout()
         self.run_cascade_btn = QPushButton("Run CASCADE")
@@ -1282,45 +1444,25 @@ class PipelineWindow(QMainWindow):
         elif default in models:
             self.model_combo.setCurrentText(default)
         self.model_combo.blockSignals(False)
-        self._reload_download_list(models)
         self._describe_model()
 
-    def _reload_download_list(self, installed):
-        """Fill the download dropdown from the index file, marking what is already here.
-
-        The model name is carried in the item's data rather than parsed back out of its
-        label, so the '✓ ' marker can never end up in a path.
-        """
-        self.download_combo.clear()
-        model_dir = self._model_dir()
-        if model_dir is None:
-            self.download_info.setText("Set CASCADE_DIR to list the downloadable models.")
-            return
-        try:
-            index = at.cascade_runner.model_index(model_dir)
-        except (FileNotFoundError, OSError, ValueError) as exc:
-            self.download_info.setText(f"No download index: {exc}")
-            return
-        for name in sorted(index):
-            here = name in installed
-            self.download_combo.addItem(f"{'✓ ' if here else ''}{name}", name)
-        # Models present on disk but absent from the index -- e.g. a hand-placed or
-        # retrained folder -- are usable but cannot be re-downloaded; say so rather than
-        # letting the two counts disagree silently.
-        unlisted = sorted(set(installed) - set(index))
-        note = f" · {len(unlisted)} local model(s) not in the index: {', '.join(unlisted)}" \
-            if unlisted else ""
-        self.download_info.setText(
-            f"<b>{len(installed)}</b> of <b>{len(index)}</b> listed model(s) "
-            f"installed{note}")
-
     def _on_download_model(self):
+        """Choose a model in the picker, then run the same download job as before."""
         model_dir = self._model_dir()
         if model_dir is None:
             return self._warn("Set CASCADE_DIR before downloading a model.")
-        name = self.download_combo.currentData()
+        try:
+            index = at.cascade_runner.model_index(model_dir)
+            installed = at.cascade_runner.available_models(model_dir)
+        except (FileNotFoundError, NotADirectoryError, OSError, ValueError) as exc:
+            return self._warn(f"Cannot list the downloadable models: {exc}")
+
+        dialog = _ModelPickerDialog(model_dir, index, installed, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return  # cancelled
+        name = dialog.selected_model()
         if not name:
-            return self._warn("No model selected to download.")
+            return
         if at.cascade_runner.is_installed(model_dir, name):
             answer = QMessageBox.question(
                 self, "Already installed",
@@ -2239,7 +2381,7 @@ class PipelineWindow(QMainWindow):
                                         and bool(self.model_combo.currentText()))
         # Downloading needs no traces and no ROIs -- it is how an empty Pretrained_models/
         # gets its first model, so it stays available whatever else the session lacks.
-        self.download_btn.setEnabled(idle and self.download_combo.count() > 0)
+        self.download_btn.setEnabled(idle and self._model_dir() is not None)
         self.save_spike_btn.setEnabled(idle and self._cascade_result is not None)
         # Needs traces for the same reason the tab used to: a rate loaded with no dF/F
         # behind it unlocks tab 6, whose analysis reads dff_matrix and would crash on it.
