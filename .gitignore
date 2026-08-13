@@ -8,7 +8,7 @@
 
 /analysis/*
 /_projectnotes/*
-/datasets/*
+/raw_data/*
 /preprocessed/*
 /labels/*.csv
 /.claude/*
@@ -211,3 +211,4 @@ cython_debug/
 ## Exceptions
 # Examples
 !labels/Debi_DRG_ROI.tiff
+!raw_data/RAW_DATA.md

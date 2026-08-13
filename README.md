@@ -187,6 +187,8 @@ Every file the app touches, which tab touches it, and the function behind it. Al
 | Pretrained model | 5 | import | `.zip` → model folder | `cascade_runner.model_index`, `download_model` |
 | Inferred spike rate | 5 | import + export | `.npy` + `.csv` + `.json` | `cascade_runner.save` / `.load`, `_save_spike_rate_csv` † |
 | Features + groups + PCA | 6 | export | `.csv` tables, `.npz` + `.json` | `save_features`, `save_groups`, `save_pca` |
+| Group mask | 6 | export | `.tiff` uint16 label image | `save_roi_labels` (via `_export_group_mask` †) |
+| Group overlay | 6 | export | `.tiff` RGBA, tab10 | `save_rgba_overlay` (via `_export_group_mask` †) |
 | Run parameters | 6 | export | `analysis_params.json` | `_save_analysis_params` † |
 | Figures | 6 | export | `.tiff` under `figures/` | `save_figure` |
 
@@ -233,11 +235,19 @@ buttons instead, because disabling the current tab makes Qt jump focus to anothe
 Importing dF/F directly means there is no pixel data behind the traces, so upstream stages
 are not stale, they are *absent*.
 
-**Disabled:** tabs 1–3 entirely — dataset/image import, preprocessing, ROI labels — plus
-the extraction window (`START_TIMEPOINT`, `EXTRACT_TIMEPOINTS`, `BASELINE_SLIDES`;
-imported traces are already baselined). Napari layers are cleared.
+**Disabled:** tabs 1–2 entirely — dataset/image import and preprocessing — plus the
+extraction window in tab 4 (`START_TIMEPOINT`, `EXTRACT_TIMEPOINTS`, `BASELINE_SLIDES`;
+imported traces are already baselined) and **New blank ROI labels**, which has no frame
+shape to size itself against. Napari layers are cleared on import.
 
-**Live:** spike inference · phases and regions · features · PCA · grouping · every export.
+**Live:** ROI label import · spike inference · phases and regions · features · PCA ·
+grouping · every export.
+
+**Tab 3 stays open**, for load and save only. An imported trace table carries no geometry,
+so a label image is the only way the pixel location of each ROI re-enters the session — and
+without one, tab 6 cannot paint its group mask. There is no stack to check the labels
+against here, so the ROI **ids** are cross-checked against the traces on load instead, and
+any that appear in only one of the two are named.
 
 **The one thing that must be got right:** frame rate. There is no `ElapsedTimes.yaml` in
 this mode, so it comes from a time column in the imported file or from manual entry. It
@@ -332,6 +342,11 @@ which counts non-zero labels rather than `len(unique) - 1`, so a label image wit
 background pixel is not undercounted). Note that importing a new label set does **not**
 invalidate traces already extracted from an older one; re-run extraction after changing
 labels.
+
+In traces-only mode this tab stays usable: **Load ROI labels** and **Save ROI labels**
+work, **New blank ROI labels** does not (there is no frame shape to size a canvas
+against), and the shape check is replaced by the id cross-check described under
+[session modes](#traces-only-mode--import--tab-4).
 
 This build renders no max/STD projection.
 
@@ -502,6 +517,17 @@ Into that folder:
 - `rate_features.csv` — per-ROI mean rate, peak rate and active fraction per phase, joined
   with the descriptive dF/F summary and the group column (`store.save_features`)
 - `roi_groups.csv` — `roi` → `rate_group` (`store.save_groups`)
+- `roi_group_mask.tiff` — the grouping painted back into image space: a uint16
+  label image carrying each ROI's group number (1..k) over its pixels, 0 elsewhere.
+  Values, not colours — read it to count pixels or to re-colour it yourself
+- `roi_group_overlay.tiff` — the same grouping as a picture: RGBA, each ROI in the
+  **tab10** colour its group has in the trace panels and the PC-space scatter, background
+  fully transparent. Lay it over a max projection of the recording and a group reads as
+  the same colour there as in every figure of the run
+
+  Both are skipped, with a line in the log, when no ROI label image is loaded — which
+  pixels an ROI occupies cannot be recovered from the traces alone. Load the matching
+  labels in tab 3 (available in traces-only mode too) and re-run
 - `pca_rate.npz` + `pca_rate.json` + `pca_rate_scores.csv` (`store.save_pca`)
 - `analysis_params.json` — everything needed to reproduce the run
 - `figures/*.tiff` (`store.save_figure`): `pca_rate_summary`, `dendrogram_rate`,
@@ -546,7 +572,7 @@ functions (`analysis_tools/plots.py`) or in `store.save_figure`.
 |---|---|---|
 | inferred-rate heatmap colormap | `magma` | `plots.rate_heatmap` |
 | heatmap colour limits | `vmin=0`, `vmax=nanpercentile(99)` | `plots.rate_heatmap` |
-| group colours | `C0`–`C9`, cycled — colours repeat past 10 groups | `plots.GROUP_COLORS` |
+| group colours | **tab10** (Tableau 10), cycled — colours repeat past 10 groups | `plots.GROUP_COLORS` |
 | figure dpi / format | `200`, TIFF, `bbox_inches="tight"` | `store.save_figure` |
 | figsize rules | `(16, 4.4)` pca_summary · `(6.4, 4.6)` pca_scatter · `(13, 4.6)` dendrogram · `(12, 0.18·n_rois + 2.2)` heatmap · `(12, 1.9·n_groups + 1.2)` group means | `plots.*` |
 | `SHOW_ROI_TRACES` | `True` | member ROIs behind group means |
@@ -559,6 +585,16 @@ functions (`analysis_tools/plots.py`) or in `store.save_figure`.
 The shaded stimulus band is the phase named `stim`; with no such phase it is the **second**
 phase in the table, or the only one in region mode. The default phase names in this build
 are `pre / injury / post`, so the shaded band is `injury` unless a phase is renamed.
+
+**Group colour is a single source of truth.** `plots.GROUP_COLORS` is pinned to
+matplotlib's `tab10` rather than written as the `C0`–`C9` property-cycle shorthand. The
+default cycle *is* tab10, so the two agree today — but the cycle follows `rcParams`, and a
+style sheet or a `seaborn` import would repaint every figure while the exported
+`roi_group_overlay.tiff`, which resolves its colours from the same list via
+`plots.group_rgb`, kept the old ones. Everything that shows a group — dendrogram, PC-space
+scatter, group-mean traces, exported overlay — reads through `plots.group_color`, which is
+what guarantees G3 is the same green in a TIFF as it is in the trace panel. Past 10 groups
+the palette repeats: the panels still agree with each other, but two groups share a colour.
 
 Constraints that are **not** preferences and stay fixed even once this panel is built:
 perceptually-uniform colormaps only, never `jet`; raw and inferred traces in separate

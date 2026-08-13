@@ -1045,7 +1045,32 @@ class PipelineWindow(QMainWindow):
         self.session.roi_labels = labels
         self._add_labels_layer(labels)
         self._report_labels()
+        self._check_labels_against_traces(labels)
         self._refresh_gating()
+
+    def _check_labels_against_traces(self, labels):
+        """Report whether a label image and the loaded traces describe the same ROIs.
+
+        In full mode the shape check already rejects labels drawn on another recording.
+        Traces-only mode has no stack to check against, so the ids are the only thing the
+        two artifacts share -- and a group mask painted from a mismatched label image is
+        silently blank for every ROI that does not line up, which looks identical to an
+        unpainted one.
+        """
+        s = self.session
+        if s.roi_ids is None:
+            return
+        painted = set(at.traces.roi_ids_in(labels))
+        analysed = {int(r) for r in s.roi_ids}
+        missing, extra = sorted(analysed - painted), sorted(painted - analysed)
+        if not (missing or extra):
+            self._log(f"> Labels and traces agree: the same {len(analysed)} ROI id(s) in both.")
+            return
+        if missing:
+            self._log(f"! {len(missing)} ROI(s) in the traces have no label of that id and "
+                      f"would be blank in a group mask: {_id_list(missing)}.")
+        if extra:
+            self._log(f"! {len(extra)} label(s) have no matching trace: {_id_list(extra)}.")
 
     def _on_save_labels(self):
         layer = self.viewer.layers[LAYER_LABELS] if LAYER_LABELS in self.viewer.layers else None
@@ -1361,7 +1386,7 @@ class PipelineWindow(QMainWindow):
         form = _form(box)
         self.cascade_dir_edit = _path_edit("(none selected) — e.g. ./CascadeTorch")
         self.cascade_dir_edit.textChanged.connect(self._on_cascade_dir_changed)
-        form.addRow("CASCADE_DIR", _path_row(self.cascade_dir_edit, self._browse_cascade_dir))
+        form.addRow("CascadeTorch Directory", _path_row(self.cascade_dir_edit, self._browse_cascade_dir))
         self.model_combo = _combo()
         self.model_combo.currentTextChanged.connect(self._describe_model)
         form.addRow(_help_label(
@@ -2243,11 +2268,101 @@ class PipelineWindow(QMainWindow):
         self._log(f"> Analysis outputs -> {out_dir}")
 
         rate = self.session.frame_rate
+        # Read here, on the UI thread: `_current_labels` prefers the live napari layer,
+        # and a worker must not touch it. None in traces-only mode.
+        labels = self._current_labels()
 
         def work():
             return _compute_analysis(spike_rate, dff, roi_ids, t, pad, rate, cfg)
 
-        self._run(work, self._finish_analysis, "Running features, PCA and clustering…")
+        def done(bundle):
+            self._export_group_mask(bundle, labels)
+            self._finish_analysis(bundle)
+
+        self._run(work, done, "Running features, PCA and clustering…")
+
+    def _export_group_mask(self, bundle, labels):
+        """Write this run's grouping back into image space, as two TIFFs.
+
+        `roi_groups.csv` says which group an ROI landed in; these say WHERE that group is.
+
+        `roi_group_mask.tiff` is the data copy: uint16, each ROI's pixels carrying its
+        Index A group number (1..k), 0 elsewhere. Values, not colours -- read it to count
+        pixels or to re-colour it however you like.
+
+        `roi_group_overlay.tiff` is the picture: RGBA, each ROI painted in the tab10 colour
+        its group has in the trace panels and the PC-space scatter, background fully
+        transparent. Lay it over a max projection of the recording and a group is the same
+        colour there as it is in every figure of the same run. Both files come from the
+        same `plots.group_color`, so they cannot drift apart.
+
+        Written per run, next to the CSVs, because the grouping is a property of the run:
+        a different window or a different k paints a different mask, and both are correct
+        for the settings that produced them.
+
+        `labels` is passed in rather than read here -- see the caller. None in traces-only
+        mode until an ROI label image is loaded in tab 3.
+        """
+        if labels is None:
+            # Not recoverable from anything else in the session: the mask needs the pixels
+            # each ROI occupies, and traces alone carry no geometry. Load or paint a label
+            # image in tab 3 -- available in traces-only mode for exactly this -- and run
+            # the analysis again.
+            self._log("> No ROI label image in this session, so no group mask was written. "
+                      "Load the matching ROI labels in tab 3 and re-run to get one.")
+            return None
+
+        labels = np.asarray(labels)
+        roi_ids, groups = bundle["roi_ids"], np.asarray(bundle["rate_groups"])
+        out_dir = Path(bundle["cfg"]["out_dir"])
+
+        # label id -> group, as a lookup indexed by label value: one vectorised pass over
+        # the image rather than a full-frame comparison per ROI. Anything not analysed
+        # keeps the 0 it was initialised with, which is also the background value.
+        painted = set(at.traces.roi_ids_in(labels))
+        lookup = np.zeros(int(labels.max()) + 1, dtype=np.uint16)
+        missing = [int(r) for r in roi_ids if int(r) not in painted]
+        for roi, group in zip(roi_ids, groups):
+            if int(roi) in painted:
+                lookup[int(roi)] = int(group)
+
+        mask = lookup[labels]
+        n_groups = int(groups.max())
+        path = out_dir / "roi_group_mask.tiff"
+        at.store.save_roi_labels(path, mask)
+        self._log(f"> Group mask -> {path} (pixel value = Index A group "
+                  f"1..{n_groups}, 0 = background)")
+
+        # The colour copy. Painted group by group rather than through a lookup table:
+        # there are at most MAX_K of them, and going via `plots.group_rgb` per group is
+        # what ties the file to the figures instead of to a palette copied out by hand.
+        # Background keeps alpha 0 -- an opaque black frame would hide the projection this
+        # is meant to sit on top of.
+        rgba = np.zeros(mask.shape + (4,), dtype=np.uint8)
+        for g in range(1, n_groups + 1):
+            sel = mask == g
+            rgba[sel, :3] = at.plots.group_rgb(g)
+            rgba[sel, 3] = 255
+        overlay_path = out_dir / "roi_group_overlay.tiff"
+        at.store.save_rgba_overlay(overlay_path, rgba)
+        swatches = " ".join(f"G{g}={at.plots.group_color(g)}"
+                            for g in range(1, min(n_groups, 10) + 1))
+        self._log(f"> Group overlay -> {overlay_path} (RGBA, tab10, transparent "
+                  f"background) · {swatches}"
+                  + ("  … colours repeat past G10" if n_groups > 10 else ""))
+
+        # Both directions of disagreement are worth naming: the label image can be
+        # repainted after extraction without invalidating the traces (a known gap), and a
+        # silently blank ROI in the mask looks identical to an unpainted one.
+        if missing:
+            self._log(f"! {len(missing)} analysed ROI(s) are absent from the current label "
+                      f"image and are blank in the mask: {_id_list(missing)}. The labels "
+                      "were changed after these traces were extracted.")
+        extra = sorted(painted - {int(r) for r in roi_ids})
+        if extra:
+            self._log(f"! {len(extra)} ROI(s) in the label image took no part in this "
+                      f"analysis and are blank in the mask: {_id_list(extra)}.")
+        return path
 
     def _analysis_parent(self):
         """The parent folder for auto-named run subfolders, asked once and remembered."""
@@ -2349,8 +2464,12 @@ class PipelineWindow(QMainWindow):
         # tab holds the model downloader. A disabled tab disables its children, so
         # gating it on has_traces made downloading impossible on a fresh clone. The
         # actions inside it carry their own gates instead.
+        # Tab 3 is available in BOTH modes, unlike tabs 1-2. Imported traces arrive with
+        # no pixel data behind them, so an ROI label image is the only way the pixel
+        # location of each ROI ever re-enters the session -- and without it tab 6 cannot
+        # paint its group mask. Extraction stays disabled there; only load/save do work.
         current = self.tabs.currentIndex()
-        for index, enabled in enumerate([full, full, full, True, True, has_rate]):
+        for index, enabled in enumerate([full, full, True, True, True, has_rate]):
             self.tabs.setTabEnabled(index, enabled)
         if self.tabs.isTabEnabled(current):
             self.tabs.setCurrentIndex(current)
@@ -2364,9 +2483,14 @@ class PipelineWindow(QMainWindow):
                                       and s.stack is not None)
         # A .zarr store is a complete entry point, so loading one is available immediately.
         self.load_zarr_btn.setEnabled(full and idle)
-        for widget in (self.new_labels_btn, self.load_labels_btn):
-            widget.setEnabled(full and idle and (has_stack or s.frame_shape is not None))
-        self.save_labels_btn.setEnabled(full and idle and has_labels)
+        # A blank canvas has to be sized against something, so it stays a full-mode
+        # action. Loading does not: in traces-only mode there is no stack to check the
+        # shape against, and the ids are cross-checked against the traces instead.
+        self.new_labels_btn.setEnabled(
+            full and idle and (has_stack or s.frame_shape is not None))
+        self.load_labels_btn.setEnabled(
+            idle and (not full or has_stack or s.frame_shape is not None))
+        self.save_labels_btn.setEnabled(idle and has_labels)
         self.extract_box.setEnabled(
             full and idle and has_labels
             and self._dir(self.extract_zarr_edit) is not None)
@@ -2441,6 +2565,12 @@ class PipelineWindow(QMainWindow):
     def _warn(self, message):
         self._log(f"! {message}")
         QMessageBox.warning(self, "Cannot continue", message)
+
+
+def _id_list(ids, limit=10):
+    """A comma-separated id list, truncated so one stray ROI set cannot flood the log."""
+    head = ", ".join(str(i) for i in ids[:limit])
+    return head if len(ids) <= limit else f"{head}, … (+{len(ids) - limit} more)"
 
 
 def _save_spike_rate_csv(out_dir, spike_rate, roi_ids, t):

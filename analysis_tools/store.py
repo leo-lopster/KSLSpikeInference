@@ -166,6 +166,31 @@ def save_roi_labels(path, labels):
     return path
 
 
+def save_rgba_overlay(path, rgba):
+    """Write an (H, W, 4) uint8 RGBA image as a .tiff, for laying over another image.
+
+    A picture, not data: the values are colours picked to match the figures, and nothing
+    downstream should read ids back out of them -- that is what the uint16 label image
+    written beside it is for.
+
+    Alpha is what makes it an overlay rather than a replacement. Background pixels are
+    written fully transparent, so dropping this on top of a projection in napari, Fiji or
+    QuPath leaves the image visible everywhere no ROI was drawn. `extrasamples` states
+    that the fourth channel is unassociated alpha; without it readers are entitled to
+    treat the file as premultiplied and darken every colour toward the background.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rgba = np.asarray(rgba)
+    if rgba.ndim != 3 or rgba.shape[2] != 4:
+        raise ValueError(f"Expected an (H, W, 4) RGBA image, got shape {rgba.shape}.")
+    tifffile.imwrite(str(path), rgba.astype(np.uint8), photometric="rgb",
+                     extrasamples="unassalpha")
+    opaque = int((rgba[..., 3] > 0).sum())
+    print(f"> Saved RGBA overlay {rgba.shape[:2]}, {opaque} opaque px -> {path}")
+    return path
+
+
 # ------------------------------------------------------------- preprocessed stack
 
 def save_preprocessed(stack, out_dir, tag, m_tag, params):

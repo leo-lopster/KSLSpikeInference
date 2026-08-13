@@ -17,17 +17,39 @@ affinity into the Qt event loop.
 from __future__ import annotations
 
 import numpy as np
+from matplotlib import colormaps
+from matplotlib.colors import to_hex, to_rgb
 from matplotlib.figure import Figure
 from scipy.cluster.hierarchy import dendrogram
 
-# Qualitative colours for group overlays. Cycled, so k > len() repeats rather than
-# failing; the dendrogram and the scatter therefore agree on colour only up to 10 groups.
-GROUP_COLORS = [f"C{i}" for i in range(10)]
+# Qualitative colours for group overlays: Tableau 10, matplotlib's `tab10`.
+#
+# Pinned to the colormap rather than written as the 'C0'..'C9' property-cycle shorthand.
+# The default cycle IS tab10, so the two agree today -- but the cycle follows rcParams,
+# and a style sheet, a seaborn import or a matplotlib default change would repaint every
+# figure while the exported group mask, whose colours are resolved from this same list,
+# kept the old ones. The point of the mask is that its colours match the figures, so the
+# palette has to be a fixed fact rather than an ambient setting.
+#
+# Cycled, so k > 10 repeats rather than failing; beyond 10 groups the dendrogram, the
+# scatter, the group means and the mask still agree with each other, but two different
+# groups share a colour.
+GROUP_COLORS = [to_hex(c) for c in colormaps["tab10"].colors]
 
 
 def group_color(g):
     """Colour for group `g` (1-based), matching across every panel that shows groups."""
     return GROUP_COLORS[(int(g) - 1) % len(GROUP_COLORS)]
+
+
+def group_rgb(g):
+    """`group_color` as an 8-bit (R, G, B) triple, for painting colour into an image.
+
+    The single source of truth for group colour is `GROUP_COLORS`, and everything --
+    figures and exported mask alike -- resolves through here or `group_color`, which is
+    what keeps a group the same colour in a TIFF as it is in the trace panels.
+    """
+    return tuple(int(round(255 * v)) for v in to_rgb(group_color(g)))
 
 
 def pca_summary(pca, scores, features, roi_ids, title, var_target=0.80, groups=None):
@@ -112,7 +134,10 @@ def dendrogram_plot(Z, roi_ids, title, cut):
 
 
 def rate_heatmap(spike_rate, t, roi_ids, groups, stim_window, title):
-    """Inferred rate per ROI, rows sorted by group, group boundaries drawn in white."""
+    """Inferred rate per ROI, rows sorted by group, group boundaries drawn in white.
+
+    `stim_window` may be None -- a region analysis has no stimulus phase to mark out.
+    """
     order = np.argsort(groups, kind="stable")
     fig = Figure(figsize=(12, 0.18 * len(roi_ids) + 2.2))
     ax = fig.subplots()
@@ -121,7 +146,7 @@ def rate_heatmap(spike_rate, t, roi_ids, groups, stim_window, title):
                    extent=[t[0], t[-1], len(roi_ids) - 0.5, -0.5])
     for boundary in np.flatnonzero(np.diff(groups[order])) + 0.5:
         ax.axhline(boundary, color="w", lw=1.2)
-    for edge in stim_window:
+    for edge in stim_window or ():
         ax.axvline(edge, color="w", ls="--", lw=0.9)
     ax.set_yticks(range(len(roi_ids)))
     ax.set_yticklabels([f"{roi_ids[i]} (G{groups[i]})" for i in order], fontsize=6)
@@ -143,6 +168,10 @@ def group_means(spike_rate, t, groups, roi_ids, stim_window, pad, title,
 
     y-axes are independent: a shared scale would flatten every low-rate group to a
     straight line once a high-rate group is present.
+
+    `stim_window` may be None, and is for a region analysis: the window IS the region, so
+    shading it would grey out every panel edge to edge and mark nothing off against
+    anything.
     """
     n_groups = int(groups.max())
     valid = slice(pad, len(t) - pad) if pad else slice(None)
@@ -154,7 +183,8 @@ def group_means(spike_rate, t, groups, roi_ids, stim_window, pad, title,
         members = np.flatnonzero(groups == g)
         sel = spike_rate[members][:, valid]
         color = group_color(g)
-        ax.axvspan(*stim_window, color="0.88", zorder=0)
+        if stim_window is not None:
+            ax.axvspan(*stim_window, color="0.88", zorder=0)
 
         if show_rois:
             for row in sel:
@@ -171,7 +201,9 @@ def group_means(spike_rate, t, groups, roi_ids, stim_window, pad, title,
 
     np.atleast_1d(axes)[-1].set_xlabel("Time (s)")
     subtitle = ("grey = individual ROIs, coloured = group mean ± SEM (colour matches the "
-                "PC-space scatter), shaded band = stimulus")
+                "PC-space scatter)")
+    if stim_window is not None:
+        subtitle += ", shaded band = stimulus"
     fig.suptitle(f"{title}\n{subtitle}", y=0.995)
     fig.tight_layout()
     return fig
