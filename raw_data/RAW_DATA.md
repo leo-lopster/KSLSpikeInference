@@ -209,6 +209,7 @@ points in their own right, with their own naming rules (full detail in the
 |---|---|---|
 | Preprocessed stack | Tab 2 · **Load from Zarr** | `<dataset_tag>_<method>.zarr` with a sibling `<dataset_tag>_<method>.params.json`. The name is parsed for the tag and the denoise chain, so `_` before the method matters. |
 | dF/F traces | Tab 4 · **Import dF/F** | `.csv` (a time column named `time`/`time_s`/`t`/`seconds`…, then one column per ROI, ideally `ROI1`, `ROI2`, … so ROI ids survive the round trip), `.npz` with a `dff` key plus optional `t` and `roi_ids`, or a bare 2-D `.npy`. |
+| ROI trace export | Tab 4 · **Import dF/F** | Tab-separated `*_roi_traces.txt` — `Frame`, `Time`, then `Green_Mean_ROI<x>` / `Red_Mean_ROI<x>` / `Trace_ROI<x>` per ROI. Converted to `.csv` beside the source before it is read; only `Trace_ROI<x>` is imported. Full spec: [DRG_Baseline/DATASET_FORMAT.md](DRG_Baseline/DATASET_FORMAT.md). |
 | ROI labels | Tab 3 · **Load ROI labels** | uint16 `.tiff` label image, shape exactly `(H, W)` of the preprocessed stack. Suggested `<dataset_tag>_ROI.tiff`; the dialog records whatever you actually pick. |
 
 A traces file with no time axis **must** be given `frame_rate_hz` at import — the importer

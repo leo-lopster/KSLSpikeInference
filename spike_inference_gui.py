@@ -1207,7 +1207,7 @@ class PipelineWindow(QMainWindow):
 
     def _browse_import(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import dF/F", self._dialog_start(),
-                                              "Traces (*.csv *.npz *.npy)")
+                                              "Traces (*.csv *.npz *.npy *.txt)")
         if path:
             self.import_path_edit.setText(path)
 

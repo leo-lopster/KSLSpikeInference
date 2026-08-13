@@ -183,6 +183,7 @@ Every file the app touches, which tab touches it, and the function behind it. Al
 | Preprocessed stack | 2 | import + export | `.zarr` + `.params.json` | `save_preprocessed`, `load_preprocessed` |
 | ROI labels | 3 | import + export | `.tiff` uint16 label image | `load_roi_labels`, `save_roi_labels` |
 | dF/F traces, many ROIs | 4 | import | `.csv` / `.npz` / `.npy` | `load_traces`, `import_dff` |
+| ROI trace export | 4 | import + export | `.txt` (tab-separated) → `.csv` | `convert_roi_traces_txt`, called by `import_dff` |
 | dF/F traces | 4 | export | `.npz` + `.csv` + `.json` | `save_traces` |
 | Pretrained model | 5 | import | `.zip` → model folder | `cascade_runner.model_index`, `download_model` |
 | Inferred spike rate | 5 | import + export | `.npy` + `.csv` + `.json` | `cascade_runner.save` / `.load`, `_save_spike_rate_csv` † |

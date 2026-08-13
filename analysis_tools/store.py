@@ -23,6 +23,7 @@ sidecar recording what produced the data (CLAUDE.md §4 "always log method + par
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -302,10 +303,83 @@ def load_traces(out_dir):
     return out
 
 
+# Columns of a `*_roi_traces.txt` export: the analysed signal, and the two raw channel
+# means kept beside it. Only the first is a trace; matched exactly so `Trace_ROI12` is
+# taken and a hand-added `Trace_ROI12_corrected` is not.
+_TRACE_COLUMN = re.compile(r"^Trace_ROI(\d+)$")
+
+
+def convert_roi_traces_txt(path, out_path=None):
+    """Convert a tab-separated `*_roi_traces.txt` export into the CSV the pipeline reads.
+
+    The source format is one row per frame and THREE columns per ROI --
+    `Green_Mean_ROI<x>`, `Red_Mean_ROI<x>`, `Trace_ROI<x>` -- behind a `Frame` and a
+    `Time` column. Only `Trace_ROI<x>` is a trace: it is the analysed signal (a dF/F of
+    the green channel normalised against red), already baselined and dimensionless. The
+    two `*_Mean_` columns are the raw per-channel ROI means kept for provenance, and
+    feeding them to spike inference as if they were dF/F would be a plain unit error.
+
+    Writes `<stem>.csv` beside the source (or `out_path`) in this package's own trace
+    layout -- `time_s`, then one `ROI<x>` column per ROI -- so the result imports through
+    `import_dff` like any other trace table and round-trips its ROI ids.
+
+    Returns the path written.
+    """
+    path = Path(path)
+    with open(path) as f:
+        header = f.readline()
+    sep = "\t" if "\t" in header else ","
+    table = pd.read_csv(path, sep=sep)
+
+    # Sorted by the ROI NUMBER, not by the column name: a text sort orders ROI10 before
+    # ROI2, and the column order here becomes the row order of every matrix, group listing
+    # and figure downstream.
+    found = [(int(m.group(1)), c) for c in table.columns
+             if (m := _TRACE_COLUMN.match(str(c).strip()))]
+    if not found:
+        raise ValueError(
+            f"No 'Trace_ROI<n>' columns in {path.name}; found {list(table.columns)[:6]}... "
+            "This converter expects a *_roi_traces.txt export.")
+    found.sort()
+    roi_ids = [roi for roi, _ in found]
+
+    out = pd.DataFrame({f"ROI{roi}": table[col].to_numpy(dtype=float)
+                        for roi, col in found})
+
+    time_names = [c for c in table.columns if str(c).strip().lower() in _TIME_NAMES]
+    if time_names:
+        out.insert(0, "time_s", table[time_names[0]].to_numpy(dtype=float))
+        when = f"time from column {time_names[0]!r}"
+    else:
+        # No time axis to carry over. Left out rather than faked from the frame index:
+        # `import_dff` then demands frame_rate_hz outright instead of accepting a
+        # plausible-looking axis nobody chose.
+        when = "no time column found -- frame_rate_hz will be required on import"
+
+    out_path = Path(out_path) if out_path else path.with_suffix(".csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    existed = out_path.exists()
+    out.to_csv(out_path, index=False)
+
+    dropped = len(table.columns) - len(found) - bool(time_names)
+    print(f"> Converted {path.name} -> {out_path.name}: {len(roi_ids)} ROI(s) x "
+          f"{len(out)} frames, {when}; {dropped} non-trace column(s) left behind"
+          f"{' (overwrote an existing CSV)' if existed else ''}")
+    return out_path
+
+
 def import_dff(path, orientation="auto", time_column="auto", frame_rate_hz=None):
     """Import dF/F traces produced anywhere -- the traces-only entry point.
 
-    Accepts .csv, .npz (keys `dff`, optionally `t`/`roi_ids`) or a bare 2-D .npy.
+    Accepts .csv, .npz (keys `dff`, optionally `t`/`roi_ids`), a bare 2-D .npy, or a
+    tab-separated `*_roi_traces.txt` export.
+
+    A .txt is CONVERTED FIRST: `convert_roi_traces_txt` writes the .csv beside it and that
+    file is what gets read. The conversion is a real step with real choices in it --
+    picking `Trace_ROI<x>` out of three columns per ROI, ordering ROIs numerically -- and
+    writing it down leaves the table that was actually imported on disk to be looked at,
+    rather than a transformation that happened once inside a process that has since
+    exited.
 
     `orientation` -- "roi_rows", "roi_cols", or "auto". Auto reads a table with a time
     column as roi_cols (one column per ROI); otherwise it assumes the longer axis is
@@ -322,6 +396,18 @@ def import_dff(path, orientation="auto", time_column="auto", frame_rate_hz=None)
     """
     path = Path(path)
     resolved = {"source": str(path), "orientation": orientation, "time_column": time_column}
+    if path.suffix.lower() == ".txt":
+        path = convert_roi_traces_txt(path)
+        resolved["converted_from"] = resolved["source"]
+        resolved["source"] = str(path)
+        if orientation == "auto":
+            # The converter wrote one column per ROI, so this is known rather than
+            # guessable -- and the guess is wrong exactly when it costs most. With no time
+            # column to anchor it, `auto` falls back to "the longer axis is time", which
+            # transposes any recording with more ROIs than frames. This dataset family
+            # reaches 291 ROIs, so a clip of a few hundred frames is not a hypothetical.
+            orientation = "roi_cols"
+            resolved["orientation"] = "roi_cols (from the .txt layout)"
 
     if path.suffix == ".csv":
         table = pd.read_csv(path)
