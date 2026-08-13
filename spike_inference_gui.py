@@ -86,7 +86,7 @@ class Session:
     # stage 1-2: images
     data_dir: Path | None = None
     tag: str = ""                     # set when a .zarr is loaded without its source .imgdir
-    image_files: list = field(default_factory=list)
+    image_files: list = field(default_factory=list)  # (path, index) per frame, either layout
     frame_shape: tuple | None = None
     times_s: np.ndarray | None = None
     acq_rate: float | None = None
@@ -675,21 +675,24 @@ class PipelineWindow(QMainWindow):
         fallback = self.fallback_hz_spin.value()
 
         def work():
-            files = at.store.list_frames(data_dir, channel)
+            # One entry per FRAME, not per file: an .imgdir either stores one file per
+            # timepoint or the whole stack in a single array, and `frame_index` addresses
+            # both the same way so preprocessing never has to know which it got.
+            frames = at.store.frame_index(data_dir, channel)
             stack = at.store.load_imgdir(data_dir, channel)
             times, rate, source = at.store.load_timebase(data_dir, stack.shape[0], fallback)
-            return files, stack, times, rate, source
+            return frames, stack, times, rate, source
 
         def done(result):
-            files, stack, times, rate, source = result
+            frames, stack, times, rate, source = result
             s = self.session
-            s.data_dir, s.image_files, s.raw_stack = data_dir, files, stack
+            s.data_dir, s.image_files, s.raw_stack = data_dir, frames, stack
             s.tag = ""
             s.frame_shape = tuple(stack.shape[1:])
             s.times_s, s.acq_rate, s.time_source = times, rate, source
             self._add_layer(LAYER_RAW, stack)
             self.dataset_info.setText(
-                f"<b>{data_dir.name}</b><br>{len(files)} timepoints · frame {s.frame_shape} "
+                f"<b>{data_dir.name}</b><br>{len(frames)} timepoints · frame {s.frame_shape} "
                 f"{stack.dtype}<br>time axis: {source} · ~{rate:.2f} Hz<br>"
                 f"dataset_tag: <b>{s.dataset_tag}</b>")
             self._sync_derived_paths()

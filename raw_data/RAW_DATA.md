@@ -2,11 +2,13 @@
 
 ## **TL;DR**
 
-A dataset is a single folder holding one recording that was saved as thousands
-of separate image files, one per moment in time. Two things have to be right. The image
-files must be named `ImageData_Ch0_TP0000000.npy`, `ImageData_Ch0_TP0000001.npy`, … —
-counting upwards, always with the same number of digits, because the app puts them in
-order by name and uneven digits shuffle the recording out of sequence. And the folder
+A dataset is a single folder holding one recording. The pictures come in one of two
+arrangements, and both work: either thousands of separate image files, one per moment in
+time, or a single file holding the whole recording at once. Two things have to be right.
+The image files must be named `ImageData_Ch0_TP0000000.npy`,
+`ImageData_Ch0_TP0000001.npy`, … — counting upwards, always with the same number of
+digits, because the app puts them in order by name and uneven digits shuffle the recording
+out of sequence (a one-file recording is just `…TP0000000.npy` on its own). And the folder
 should contain `ElapsedTimes.yaml`, the small text file the microscope writes to record
 when each image was taken; without it the app still runs, but it has to *assume* how fast
 the recording went, and a wrong assumption makes every later result wrong in a way that
@@ -38,6 +40,8 @@ provenance and never opened:
 | `AnnotationRecord.yaml` | Ignored | — |
 | `AuxData.yaml` | Ignored | — |
 | `HistogramData_Ch<c>_TP<nnnnnnn>.npy` | Ignored | — |
+| `HistogramSummary_Ch<c>.npy`, `ImageRecord.yaml`, `MaskRecord.yaml`, `SAPositionData.yaml`, `StagePositionData.yaml` | Ignored | — |
+| `experiment_summary.json` / `.pkl` | Ignored, but see [§1](#1-metadata) | — |
 
 A folder containing nothing but the `ImageData_*.npy` frames will load and run. It will run
 on a **nominal** time axis, which is the one thing in this document that quietly corrupts
@@ -83,6 +87,20 @@ that looks entirely plausible and is wrong throughout. **Check the time source l
 loading.** A length mismatch in particular means the metadata does not describe these
 frames — usually a folder that was copied or truncated part-way.
 
+### `experiment_summary.json` / `.pkl` — not read, but the best record of the run
+
+Present in the newer `DRG_SNI-live_recordings` exports and worth reading by hand: it
+states `n_frames`, `height`, `width`, `pixel_size` (µm), `FOV_size`, which channel is
+green and which is red, the acquisition date/time, the stage position, and the
+stimulation protocol — `stimulation_events`, `stimulation_timeframes`, `stimulation_ms`,
+`repetitions`, `duty_cycle`, `stimulated_rois`. It also repeats the timebase as
+`time_stamps` (ms, one per frame, no leading count entry — unlike `ElapsedTimes.yaml`).
+
+Nothing in the pipeline opens it. Where its `n_frames`, `height` and `width` are a useful
+independent check on what was loaded, the stimulation fields are the obvious source for
+the Tab 6 phase table — currently typed in by hand. Both are unimplemented, not
+unavailable.
+
 ### `ChannelRecord.yaml`, `AnnotationRecord.yaml`, `AuxData.yaml` — ignored
 
 Emitted by the 3i system; no code path opens them. They carry the exposure record, ROI
@@ -115,22 +133,44 @@ ImageData_Ch<channel>_TP<timepoint>.npy
 | Numbering | Starts at 0 in the example. Nothing depends on the start value or on the numbers being contiguous — the sorted order is what matters, and a gap simply means the frame does not exist. |
 | Extension | `.npy` only. |
 
-### Array format inside each file
+### Array format inside each file — two layouts
+
+Both are read; which one you have is detected from the `.npy` header of the first file,
+never from the file count.
+
+| Layout | Files per channel | Array shape | Seen in |
+|---|---|---|---|
+| **per-timepoint** | one per frame, `TP0000000` … `TP<N-1>` | `(1, H, W)` | `Debi_DRG-Streamtodisk-…imgdir` |
+| **single-stack** | **one**, always `TP0000000` | `(T, H, W)` | `DRG_SNI-live_recordings/Slide1.dir/…imgdir` |
 
 | Property | Requirement | Example |
 |---|---|---|
-| Shape | **`(1, H, W)`** — a singleton leading plane axis | `(1, 1024, 1376)` |
+| Axes | Leading axis is **frames**, then `(y, x)` | `(667, 356, 396)` = 667 frames, y=356, x=396 |
 | dtype | Any numeric; converted to float32 during preprocessing | `uint16` |
-| Consistency | Every frame must share the shape and dtype of the **first** one | — |
+| Consistency | Every frame shares the shape and dtype of the **first** | — |
 
-The singleton axis is not optional. `load_frame` is `np.load(path)[0]`, so a bare `(H, W)`
-array does not raise — it returns row 0, a 1-D line of pixels, and the whole recording
-loads as a stack of single rows. The first symptom is an ROI-label shape mismatch several
-tabs later. Save frames as `arr[None, ...]` if you are generating them yourself.
+The leading axis is not optional in either layout. A bare `(H, W)` array does not raise —
+it is read as a stack whose "frames" are single pixel rows, and the first symptom is an
+ROI-label shape mismatch several tabs later. Save frames as `arr[None, ...]` if you are
+generating them yourself.
 
-Only the first frame is opened when a dataset is loaded; it supplies the shape and dtype
-that the lazy dask stack declares for all the others. A later frame of a different shape
-therefore fails at compute time — during the Zarr write or trace extraction — not at load.
+**Why the file count cannot decide the layout.** A single-stack recording read as
+one-file-per-timepoint yields a **1-frame** movie: the loader takes `array[0]` and stops.
+Nothing raises, because a 1-frame stack is a legal stack — the frame count silently
+becomes whatever was assumed rather than what is on disk. `store.frame_layout` therefore
+reads the leading axis of the first file (header only, no pixels) and reports
+`per-timepoint` or `single-stack` in the log line when the dataset loads. Check it:
+
+```
+> 667 timepoints, frame (356, 396) uint16 [single-stack (1 file(s) of 667 frames)] <- …
+> 3220 timepoints, frame (1024, 1376) uint16 [per-timepoint (3220 files)] <- …
+```
+
+Frames are addressed as `(file, index)` pairs — `store.frame_index` — so one code path
+covers both layouts, and reads are memory-mapped: pulling frame 500 out of a 188 MB stack
+costs one frame, not the file. Only headers are read when a dataset is opened; a later
+frame of a different shape therefore fails at compute time — during the Zarr write or
+trace extraction — not at load.
 
 ### Channels
 
@@ -138,9 +178,12 @@ One channel is analysed at a time. **Use Channel...** in Tab 1 selects it, the m
 frames become the stack, and frames of every other channel are ignored for that session.
 To compare channels, load the dataset twice and preprocess each into its own `.zarr` store.
 
-The example is single-channel (`Ch0` only). For a two-channel acquisition expect
-`ImageData_Ch0_TP*.npy` and `ImageData_Ch1_TP*.npy` interleaved in the same folder, and
-set the spin box to whichever carries the calcium indicator. A wrong channel number is
+`Debi_DRG` is single-channel (`Ch0` only). A two-channel acquisition carries
+`ImageData_Ch0_*.npy` and `ImageData_Ch1_*.npy` side by side in the same folder — set the
+spin box to whichever holds the calcium indicator. In the `DRG_SNI-live_recordings`
+datasets that is **`Ch0` (green)**, with `Ch1` the red reference channel; both are
+`(667, 356, 396)`, and `experiment_summary.json` states the mapping outright as
+`green_channel: 0, red_channel: 1`. A wrong channel number is
 reported immediately and by name:
 
 ```

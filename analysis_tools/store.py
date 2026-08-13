@@ -78,26 +78,84 @@ def list_frames(data_dir, channel=0):
     return files
 
 
-def load_frame(path):
-    """One frame as (H, W) -- the stored arrays carry a singleton plane axis."""
-    return np.load(path)[0]
+def load_frame(path, index=0):
+    """One frame as (H, W), addressed as `index` within the file that holds it.
+
+    Both .imgdir layouts store frames with a leading axis -- one file per timepoint with
+    a singleton plane axis, or one file holding the whole stack (see `frame_layout`) --
+    so a (file, index) pair addresses a frame in either. Memory-mapped, so reading frame
+    500 of a 188 MB stack costs one frame, not the file.
+    """
+    return np.load(path, mmap_mode="r")[index]
+
+
+def frame_layout(data_dir, channel=0):
+    """How this .imgdir stores its frames. Returns (files, n_frames, frame_shape, dtype).
+
+    Two layouts exist in the wild and they are told apart by the leading axis of the
+    first file, read from the .npy header alone:
+
+      per-timepoint  N files of (1, H, W)  -- one file per frame, the streamed layout
+      single-stack   1 file  of (T, H, W)  -- the whole recording in one array
+
+    Counting files is not enough to tell them apart, and getting it wrong is silent: a
+    single-stack recording read as one-file-per-frame yields a 1-frame movie, and the
+    frame count is then whatever the loader assumed rather than what is on disk.
+    """
+    files = list_frames(data_dir, channel)
+    probe = np.load(files[0], mmap_mode="r")
+    if probe.ndim != 3:
+        raise ValueError(
+            f"{files[0].name} holds a {probe.ndim}-D array {probe.shape}; expected "
+            "(1, H, W) for a per-timepoint frame or (T, H, W) for a whole stack.")
+    per_file = int(probe.shape[0])
+    n_frames = per_file * len(files) if per_file > 1 else len(files)
+    return files, n_frames, tuple(probe.shape[1:]), probe.dtype
+
+
+def frame_index(data_dir, channel=0):
+    """Every frame as a (path, index) pair, in acquisition order, for either layout.
+
+    The canonical per-frame address in this package. Preprocessing builds one lazy frame
+    per entry, so it does not have to know which layout it is reading.
+    """
+    files, _n, _shape, _dtype = frame_layout(data_dir, channel)
+    per_file = int(np.load(files[0], mmap_mode="r").shape[0])
+    if per_file > 1:
+        return [(f, i) for f in files for i in range(int(np.load(f, mmap_mode="r").shape[0]))]
+    return [(f, 0) for f in files]
 
 
 def load_imgdir(data_dir, channel=0):
     """Lazy (n_timepoints, H, W) dask array over an .imgdir, one frame per chunk.
 
-    Nothing is read beyond the first frame (for shape/dtype) until something computes.
+    Nothing is read beyond the .npy headers until something computes.
     """
     import dask.array as da
     from dask import delayed
 
-    files = list_frames(data_dir, channel)
-    probe = load_frame(files[0])
-    lazy = delayed(load_frame)
-    stack = da.stack([
-        da.from_delayed(lazy(f), shape=probe.shape, dtype=probe.dtype) for f in files
-    ], axis=0)
-    print(f"> {len(files)} timepoints, frame {probe.shape} {probe.dtype} <- {Path(data_dir).name}")
+    files, n_frames, shape, dtype = frame_layout(data_dir, channel)
+    per_file = int(np.load(files[0], mmap_mode="r").shape[0])
+
+    if per_file > 1:
+        # Whole-stack files: hand dask the memmap directly and let it chunk by frame.
+        # Going through `delayed` per frame would build a 667-node graph over an array
+        # that already slices lazily.
+        stack = da.concatenate(
+            [da.from_array(np.load(f, mmap_mode="r"), chunks=(1, -1, -1)) for f in files],
+            axis=0)
+        layout = f"single-stack ({len(files)} file(s) of {per_file} frames)"
+    else:
+        # One file per timepoint. Kept on `delayed` rather than memory-mapping each file:
+        # a 3220-frame recording is 3220 separate opens, and doing them at graph-build
+        # time would stall the load for a whole directory scan.
+        lazy = delayed(load_frame)
+        stack = da.stack([da.from_delayed(lazy(f, 0), shape=shape, dtype=dtype)
+                          for f in files], axis=0)
+        layout = f"per-timepoint ({len(files)} files)"
+
+    print(f"> {n_frames} timepoints, frame {shape} {dtype} [{layout}] "
+          f"<- {Path(data_dir).name}")
     return stack
 
 

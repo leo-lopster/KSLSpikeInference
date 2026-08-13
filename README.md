@@ -178,7 +178,7 @@ Every file the app touches, which tab touches it, and the function behind it. Al
 
 | Data | Tab | Direction | Format | Function |
 |---|---|---|---|---|
-| Frame images from an `.imgdir` | 1 | import | `ImageData_Ch<n>_TP*.npy` | `list_frames`, `load_frame`, `load_imgdir`, `load_timebase` |
+| Frame images from an `.imgdir` | 1 | import | `ImageData_Ch<n>_TP*.npy`, one file per frame **or** one holding the whole stack | `list_frames`, `frame_layout`, `frame_index`, `load_frame`, `load_imgdir` |
 | Acquisition timebase | 1 | import | `ElapsedTimes.yaml` | `load_timebase` |
 | Preprocessed stack | 2 | import + export | `.zarr` + `.params.json` | `save_preprocessed`, `load_preprocessed` |
 | ROI labels | 3 | import + export | `.tiff` uint16 label image | `load_roi_labels`, `save_roi_labels` |

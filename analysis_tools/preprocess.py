@@ -133,9 +133,14 @@ def reference_frame(first_frame, params):
         denoise_frame(first_frame.astype(np.float32), params), params.background_percentile)
 
 
-def preprocess_frame(path, reference, params):
-    """Load one frame and run it through the whole chain. Returns float32, clipped at 0."""
-    frame = np.load(path)[0].astype(np.float32)
+def preprocess_frame(path, reference, params, index=0):
+    """Load one frame and run it through the whole chain. Returns float32, clipped at 0.
+
+    `index` addresses the frame within its file: 0 for the one-file-per-timepoint layout,
+    the frame number for an .imgdir holding the whole stack in a single array. Reading is
+    memory-mapped, so a frame costs a frame rather than the whole file.
+    """
+    frame = np.load(path, mmap_mode="r")[index].astype(np.float32)
     frame = denoise_frame(frame, params)
     frame = normalise_to_background(frame, params.background_percentile)
     frame_shift, _, _ = phase_cross_correlation(reference, frame,
@@ -149,20 +154,32 @@ def build_stack(image_files, params, first_frame=None):
 
     Nothing is computed here: the returned dask array carries one delayed frame per
     chunk, so it can be added to napari or streamed to Zarr without materialising.
+
+    `image_files` is a sequence of (path, index) pairs as returned by
+    `store.frame_index` -- one entry per FRAME, not per file, so the same code covers an
+    .imgdir with one file per timepoint and one holding the whole stack in a single
+    array. Bare paths are accepted too and read as (path, 0), which is what the
+    per-timepoint layout meant before the single-stack one existed.
     """
     import dask.array as da
     from dask import delayed
 
+    frames_in = [f if isinstance(f, (tuple, list)) else (f, 0) for f in image_files]
+    if not frames_in:
+        raise ValueError("No frames to preprocess.")
+
     if first_frame is None:
-        first_frame = np.load(image_files[0])[0]
+        path, index = frames_in[0]
+        first_frame = np.load(path, mmap_mode="r")[index]
     reference = reference_frame(first_frame, params)
 
     lazy = delayed(preprocess_frame)
     frames = [
-        da.from_delayed(lazy(f, reference, params), shape=reference.shape, dtype=np.float32)
-        for f in image_files
+        da.from_delayed(lazy(path, reference, params, index),
+                        shape=reference.shape, dtype=np.float32)
+        for path, index in frames_in
     ]
     stack = da.stack(frames, axis=0)
-    print(f"> Preprocessing chain '{params.denoise_method}' over {len(image_files)} frames "
+    print(f"> Preprocessing chain '{params.denoise_method}' over {len(frames_in)} frames "
           f"-> lazy {stack.shape} {stack.dtype}")
     return stack
